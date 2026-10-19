@@ -89,6 +89,65 @@ class RagChecks(unittest.TestCase):
         self.assertTrue(all(chunks))
         self.assertLessEqual(max(map(len, chunks)), rag.CHUNK_SIZE)
 
+    def test_chunker_preserves_calendar_table_line_breaks(self):
+        chunks = rag.split_into_chunks("August 24, 2026\nFirst day of classes\nAutumn begins")
+        self.assertEqual(chunks, ["August 24, 2026\nFirst day of classes\nAutumn begins"])
+
+    def test_all_dates_query_detects_every_and_each_phrasings(self):
+        for question in (
+            "give each date",
+            "give every dates present in it",
+            "list all dates",
+        ):
+            with self.subTest(question=question):
+                self.assertTrue(rag._asks_for_all_dates(question))
+        self.assertFalse(rag._asks_for_all_dates("When is the deadline?"))
+
+    def test_all_dates_lists_full_calendar_with_event_titles_and_ranges(self):
+        self.add_passage(
+            "AUTUMN SEMESTER 2026\n"
+            "August 24, 2026 First day of classes; Autumn semester instruction begins.\n"
+            "DATE\nACADEMIC EVENT\nDETAILS\n"
+            "August 19-21, 2026\nNew student orientation\nOrientation and advising for new students.\n"
+            "September 4, 2026\nAdd/drop deadline\nLast day to add or drop a course.\n"
+            "October 12-16,\n2026\nMidterm assessment week\nInstructors may schedule exams.\n"
+            "November 6, 2026\nCourse withdrawal\ndeadline\nLast day to withdraw from an Autumn course.\n"
+        )
+        answer = rag.list_all_calendar_dates()
+        self.assertIn("August 19-21, 2026 — New student orientation", answer)
+        self.assertIn("August 24, 2026", answer)
+        self.assertIn("September 4, 2026 — Add/drop deadline", answer)
+        self.assertIn("October 12-16, 2026 — Midterm assessment week", answer)
+        self.assertIn("November 6, 2026 — Course withdrawal deadline", answer)
+        self.assertNotIn("DATE ACADEMIC EVENT DETAILS", answer)
+        self.assertEqual(answer.count("August 24, 2026"), 1)
+
+    def test_all_dates_question_bypasses_retrieval_and_gemini(self):
+        self.add_passage(
+            "AUTUMN SEMESTER 2026\n"
+            "August 24, 2026\nFirst day of classes\n"
+            "September 4, 2026\nAdd/drop deadline\n",
+        )
+        with patch.object(rag, "retrieve", side_effect=AssertionError("Must inspect the full corpus")), patch.object(
+            rag.requests, "post", side_effect=AssertionError("Must not call Gemini")
+        ):
+            result = rag.answer_question("give every dates present in it")
+        self.assertIn("August 24, 2026", result["answer"])
+        self.assertIn("September 4, 2026", result["answer"])
+        self.assertEqual(result["sources"][0]["filename"], "calendar.pdf")
+
+    def test_follow_up_suggestions_match_the_question_topic(self):
+        suggestions = rag.suggest_follow_up_questions("When are the Autumn semester exams?")
+        self.assertEqual(len(suggestions), 3)
+        self.assertTrue(all("Autumn" in question for question in (suggestions[0], suggestions[-1])))
+        self.assertTrue(any("deadlines" in question for question in suggestions))
+
+    def test_chat_route_returns_clickable_follow_up_question_data(self):
+        with patch.object(app, "answer_question", return_value={"answer": "Classes begin August 24.", "sources": []}):
+            response = app.chat(app.Question(question="When does Autumn semester begin?"))
+        self.assertEqual(len(response["suggestions"]), 3)
+        self.assertTrue(all(isinstance(question, str) for question in response["suggestions"]))
+
     def test_upload_indexes_text_without_gemini_embedding_request(self):
         page_text = "Project submission deadline is October 12, 2026."
         fake_reader = FakeReader([FakePage(page_text)])
@@ -159,7 +218,48 @@ class RagChecks(unittest.TestCase):
         }]
         answer = rag._local_calendar_answer("When is my project due?", sources)
         self.assertIn("couldn’t find a project completion deadline", answer)
+        self.assertIn("Sorry, I couldn't find this information", answer)
         self.assertNotIn("September 4", answer)
+
+    def test_calendar_follow_up_inherits_the_last_mentioned_semester(self):
+        expanded = rag._contextualize_follow_up(
+            "When does it end?",
+            [{"role": "user", "content": "When does Autumn semester begin?"}],
+        )
+        self.assertIn("autumn semester", expanded.lower())
+
+    def test_days_until_is_calculated_from_the_verified_calendar_date(self):
+        sources = [{
+            "filename": "calendar.pdf",
+            "page": 1,
+            "text": "Autumn classes begin Monday, August 24, 2026.",
+        }]
+        with patch.object(rag, "_today", return_value=__import__("datetime").date(2026, 7, 19)):
+            answer = rag._days_until_answer("How many days until Autumn semester begins?", sources)
+        self.assertIn("36 days", answer)
+        self.assertIn("August 24, 2026", answer)
+
+    def test_countdown_question_uses_full_calendar_and_selects_semester_end(self):
+        self.add_passage(
+            "AUTUMN SEMESTER 2026\n"
+            "August 24, 2026\nFirst day of classes\n"
+            "November 6, 2026\nCourse withdrawal deadline\n"
+            "December 11, 2026\nLast day of classes\nFinal day of Autumn instruction.\n"
+            "December 16-18, 2026\nFinal examinations\n",
+        )
+        os.environ.pop("GEMINI_API_KEY", None)
+        with patch.object(rag, "_today", return_value=__import__("datetime").date(2026, 10, 19)), patch.object(
+            rag.requests, "post", side_effect=AssertionError("Verified countdowns must stay local")
+        ):
+            answer = rag.answer_question("How many days remain until Autumn semester ends?")
+        self.assertIn("53 days", answer["answer"])
+        self.assertIn("December 11, 2026", answer["answer"])
+        self.assertNotIn("November 6, 2026", answer["answer"])
+
+    def test_unrelated_question_gets_a_polite_scope_reply(self):
+        result = rag.answer_question("Can you write a Python game for me?")
+        self.assertIn("designed primarily", result["answer"])
+        self.assertEqual(result["sources"], [])
 
     def test_table_extraction_keeps_event_attached_to_date(self):
         source = {
@@ -248,6 +348,17 @@ class RagChecks(unittest.TestCase):
     def test_ui_does_not_show_raw_source_cards(self):
         script = (Path(__file__).parents[1] / "web" / "app.js").read_text(encoding="utf-8")
         self.assertNotIn("source-card", script)
+
+    def test_ui_renders_and_handles_follow_up_question_chips(self):
+        script = (Path(__file__).parents[1] / "web" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("YOU COULD ALSO ASK", script)
+        self.assertIn("follow-up-question", script)
+        self.assertIn("result.suggestions", script)
+
+    def test_ui_displays_source_page_and_bolds_dates(self):
+        script = (Path(__file__).parents[1] / "web" / "app.js").read_text(encoding="utf-8")
+        self.assertIn("Source: ${citation}", script)
+        self.assertIn("<strong>$&</strong>", script)
 
     def test_public_render_config_does_not_add_login_credentials(self):
         config = (Path(__file__).parents[1] / "render.yaml").read_text(encoding="utf-8")
