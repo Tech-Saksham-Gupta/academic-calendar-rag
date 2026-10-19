@@ -61,6 +61,8 @@ class RagChecks(unittest.TestCase):
         self.original_database = rag.DATABASE_PATH
         self.original_provider = rag.AI_PROVIDER
         self.original_api_key = os.environ.get("GEMINI_API_KEY")
+        self.original_deepseek_api_key = os.environ.get("DEEPSEEK_API_KEY")
+        self.original_meta_api_key = os.environ.get("MODEL_API_KEY")
         rag.DATABASE_PATH = Path(self.temp_dir.name) / "calendar.db"
         rag.AI_PROVIDER = "gemini"
 
@@ -71,6 +73,14 @@ class RagChecks(unittest.TestCase):
             os.environ.pop("GEMINI_API_KEY", None)
         else:
             os.environ["GEMINI_API_KEY"] = self.original_api_key
+        if self.original_deepseek_api_key is None:
+            os.environ.pop("DEEPSEEK_API_KEY", None)
+        else:
+            os.environ["DEEPSEEK_API_KEY"] = self.original_deepseek_api_key
+        if self.original_meta_api_key is None:
+            os.environ.pop("MODEL_API_KEY", None)
+        else:
+            os.environ["MODEL_API_KEY"] = self.original_meta_api_key
         self.temp_dir.cleanup()
 
     def add_passage(self, text, page=1, filename="calendar.pdf"):
@@ -153,15 +163,28 @@ class RagChecks(unittest.TestCase):
         self.assertEqual(answer.count("August 24, 2026"), 1)
 
     def test_all_dates_question_bypasses_retrieval_and_gemini(self):
+    def test_all_dates_question_tries_gemini_with_full_calendar_first(self):
         self.add_passage(
             "AUTUMN SEMESTER 2026\n"
             "August 24, 2026\nFirst day of classes\n"
             "September 4, 2026\nAdd/drop deadline\n",
         )
+        os.environ["GEMINI_API_KEY"] = "test-key"
+
+        class GeminiResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"candidates": [{"content": {"parts": [{"text": "- August 24, 2026: First day of classes.\n- September 4, 2026: Add/drop deadline."}]}}]}
+
         with patch.object(rag, "retrieve", side_effect=AssertionError("Must inspect the full corpus")), patch.object(
             rag.requests, "post", side_effect=AssertionError("Must not call Gemini")
         ):
+            rag.requests, "post", return_value=GeminiResponse()
+        ) as generate:
             result = rag.answer_question("give every dates present in it")
+        generate.assert_called_once()
         self.assertIn("August 24, 2026", result["answer"])
         self.assertIn("September 4, 2026", result["answer"])
         self.assertEqual(result["sources"][0]["filename"], "calendar.pdf")
@@ -324,6 +347,26 @@ class RagChecks(unittest.TestCase):
         self.assertIn("designed primarily", result["answer"])
         self.assertEqual(result["sources"], [])
 
+    def test_greeting_is_sent_to_gemini_when_configured(self):
+        os.environ["GEMINI_API_KEY"] = "test-key"
+
+        class GeminiResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"candidates": [{"content": {"parts": [{"text": "Hi! What would you like to know about your academic calendar?"}]}}]}
+
+        with patch.object(rag.requests, "post", return_value=GeminiResponse()) as generate:
+            result = rag.answer_question("hi")
+        generate.assert_called_once()
+        self.assertIn("What would you like to know", result["answer"])
+
+    def test_greeting_has_a_friendly_fallback_when_gemini_key_is_missing(self):
+        os.environ.pop("GEMINI_API_KEY", None)
+        result = rag.answer_question("hello")
+        self.assertIn("Hi! Ask me about", result["answer"])
+
     def test_table_extraction_keeps_event_attached_to_date(self):
         source = {
             "filename": "calendar.pdf",
@@ -440,6 +483,82 @@ class RagChecks(unittest.TestCase):
         config = (Path(__file__).parents[1] / "render.yaml").read_text(encoding="utf-8")
         self.assertNotIn("APP_USERNAME", config)
         self.assertNotIn("APP_PASSWORD", config)
+        self.assertIn("value: meta", config)
+        self.assertIn("key: MODEL_API_KEY", config)
+
+    def test_deepseek_uses_its_chat_api_as_the_answer_generator(self):
+        self.add_passage("Autumn classes begin August 24, 2026.")
+        rag.AI_PROVIDER = "deepseek"
+        os.environ["DEEPSEEK_API_KEY"] = "test-deepseek-key"
+
+        class DeepSeekResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"choices": [{"message": {"content": "Autumn classes begin August 24, 2026."}}]}
+
+        with patch.object(rag.requests, "post", return_value=DeepSeekResponse()) as generate:
+            result = rag.answer_question("When do Autumn classes begin?")
+        args, kwargs = generate.call_args
+        self.assertEqual(args[0], "https://api.deepseek.com/chat/completions")
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer test-deepseek-key")
+        self.assertEqual(kwargs["json"]["model"], "deepseek-flash")
+        self.assertIn("August 24, 2026", result["answer"])
+
+    def test_meta_model_api_is_used_when_selected(self):
+        self.add_passage("Autumn classes begin August 24, 2026.")
+        rag.AI_PROVIDER = "meta"
+        os.environ["MODEL_API_KEY"] = "test-meta-key"
+
+        class MetaResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"choices": [{"message": {"content": "Autumn classes begin August 24, 2026."}}]}
+
+        with patch.object(rag.requests, "post", return_value=MetaResponse()) as generate:
+            result = rag.answer_question("When do Autumn classes begin?")
+        args, kwargs = generate.call_args
+        self.assertEqual(args[0], "https://api.meta.ai/v1/chat/completions")
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer test-meta-key")
+        self.assertEqual(kwargs["json"]["model"], "muse-spark-1.3")
+        self.assertIn("August 24, 2026", result["answer"])
+
+    def test_calendar_question_reaches_meta_even_when_no_pdf_is_indexed(self):
+        rag.AI_PROVIDER = "meta"
+        os.environ["MODEL_API_KEY"] = "test-meta-key"
+
+        class MetaResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"choices": [{"message": {"content": "Sorry, I couldn't find this information in the available academic calendar. Please check the official university website or contact the university administration."}}]}
+
+        with patch.object(rag.requests, "post", return_value=MetaResponse()) as generate:
+            result = rag.answer_question("When do autumn classes begin?")
+        generate.assert_called_once()
+        self.assertIn("couldn't find this information", result["answer"])
+
+    def test_out_of_scope_turn_also_reaches_meta_to_apply_scope_instruction(self):
+        rag.AI_PROVIDER = "meta"
+        os.environ["MODEL_API_KEY"] = "test-meta-key"
+
+        class MetaResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"choices": [{"message": {"content": "I’m designed primarily to help with academic-calendar questions."}}]}
+
+        with patch.object(rag.requests, "post", return_value=MetaResponse()) as generate:
+            result = rag.answer_question("Tell me a joke")
+        generate.assert_called_once()
+        sent = generate.call_args.kwargs["json"]["messages"][1]["content"]
+        self.assertIn("Tell me a joke", sent)
+        self.assertIn("academic-calendar questions", result["answer"])
 
     def test_multiple_documents_can_be_indexed(self):
         for filename, page_text in (
