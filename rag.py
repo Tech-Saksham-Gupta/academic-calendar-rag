@@ -229,6 +229,10 @@ def retrieve(question):
         query_terms = _search_terms(question)
         if "deadline" in query_terms or "due" in query_terms:
             query_terms.extend(["add", "drop", "withdraw", "withdrawal", "due", "last", "project", "assignment", "submit"])
+        if set(query_terms) & {"begin", "start", "first"}:
+            query_terms.extend(["begin", "start", "first", "class", "instruction"])
+        if set(query_terms) & {"end", "finish", "conclude", "last"}:
+            query_terms.extend(["end", "last", "final", "class", "instruction", "session"])
         if "project" in query_terms or "assignment" in query_terms:
             query_terms.extend(["deadline", "due", "submit", "submission", "complete"])
         if not query_terms:
@@ -309,6 +313,8 @@ def _local_calendar_answer(question, sources):
         "semester": {"term", "classes", "instruction"},
         "begin": {"begins", "start", "starts", "first", "day"},
         "start": {"starts", "begins", "first", "day"},
+        "end": {"ends", "last", "final", "finish", "conclude"},
+        "finish": {"end", "ends", "last", "final", "conclude"},
         "exam": {"exams", "final", "midterm", "assessment"},
         "holiday": {"holidays", "closure", "closed", "recess"},
         "withdraw": {"withdrawal", "drop", "deadline"},
@@ -322,6 +328,10 @@ def _local_calendar_answer(question, sources):
 
     asks_about_project = bool(terms & {"project", "assignment"})
     asks_about_deadline = bool(terms & {"deadline", "due", "submit", "submission", "project", "assignment"})
+    asks_about_start = bool(terms & {"begin", "start", "first"})
+    asks_about_end = bool(terms & {"end", "finish", "conclude"})
+    asks_about_academic_period = bool(terms & {"semester", "term", "class", "instruction", "autumn", "fall", "spring", "summer", "session"})
+    requested_season = next((season for season in ("autumn", "fall", "spring", "summer") if season in terms), None)
     date_pattern = (
         r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?"
         r"|\b\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}"
@@ -340,6 +350,24 @@ def _local_calendar_answer(question, sources):
             overlap = len(terms & sentence_terms)
             has_date = bool(re.search(date_pattern, sentence, flags=re.IGNORECASE))
             if overlap and has_date and len(sentence) >= 25:
+                if requested_season:
+                    acceptable_seasons = {requested_season}
+                    if requested_season == "fall":
+                        acceptable_seasons.add("autumn")
+                    if requested_season == "autumn":
+                        acceptable_seasons.add("fall")
+                    if not (sentence_terms & acceptable_seasons):
+                        continue
+                if asks_about_academic_period and asks_about_start:
+                    if not (sentence_terms & {"begin", "begins", "start", "starts", "first"}):
+                        continue
+                    if sentence_terms & {"end", "ends", "conclude", "withdraw", "withdrawal"}:
+                        continue
+                if asks_about_academic_period and asks_about_end:
+                    has_end_event = bool(sentence_terms & {"end", "ends", "last", "final", "conclude"})
+                    has_academic_event = bool(sentence_terms & {"class", "instruction", "session"})
+                    if not (has_end_event and has_academic_event):
+                        continue
                 if asks_about_project and not (sentence_terms & {"project", "assignment", "submission", "submit"}):
                     continue
                 if asks_about_deadline and not (sentence_terms & {"deadline", "due", "withdraw", "withdrawal", "add", "drop", "project", "assignment", "submit", "submission"}):
@@ -352,7 +380,35 @@ def _local_calendar_answer(question, sources):
             return "I couldn’t find a project completion deadline in the uploaded calendar. Check the project brief or ask your instructor to confirm the due date."
         if asks_about_deadline:
             return "I couldn’t find a matching deadline in the uploaded calendar. Check the course instructions or ask your instructor to confirm the due date."
+        if asks_about_academic_period and asks_about_end:
+            return "I couldn’t find the semester end date in the uploaded calendar. Check the academic calendar or confirm it with your registrar."
+        if asks_about_academic_period and asks_about_start:
+            return "I couldn’t find the semester start date in the uploaded calendar. Check the academic calendar or confirm it with your registrar."
         return "I couldn’t find that information in the uploaded calendar. Try asking about a date or event listed there."
+
+    if asks_about_academic_period and (asks_about_start or asks_about_end):
+        selected = []
+        seen_terms = set()
+        for _, sentence, _ in candidates:
+            season = next((label for label in ("autumn", "fall", "spring", "summer") if label in _search_terms(sentence)), "")
+            date_match = re.search(date_pattern, sentence, flags=re.IGNORECASE)
+            if not date_match or (season, date_match.group(0).lower()) in seen_terms:
+                continue
+            seen_terms.add((season, date_match.group(0).lower()))
+            date = date_match.group(0)
+            if asks_about_start:
+                event = f"{season.title()} classes begin" if season in {"autumn", "fall", "spring"} else "Summer session begins" if season == "summer" else "Classes begin"
+            else:
+                event = f"{season.title()} classes end" if season in {"autumn", "fall", "spring"} else "Summer session ends" if season == "summer" else "Classes end"
+            selected.append(f"{event} on {date}.")
+            if requested_season or len(selected) == 2:
+                break
+        season_order = {"autumn": 0, "fall": 0, "spring": 1, "summer": 2}
+        selected.sort(key=lambda answer: next(
+            (order for season, order in season_order.items() if answer.lower().startswith(season)),
+            3,
+        ))
+        return " ".join(selected) if selected else "I couldn’t find that semester date in the uploaded calendar. Check with your registrar."
 
     chosen = []
     seen = set()
@@ -401,9 +457,13 @@ def answer_question(question):
 
     # Deadline answers are date lookups, so answer them directly from the
     # retrieved calendar entries instead of risking a vague generated reply.
-    if AI_PROVIDER == "gemini" and set(_search_terms(question)) & {
+    question_terms = set(_search_terms(question))
+    asks_for_academic_date = bool(question_terms & {"begin", "start", "first", "end", "finish", "conclude"}) and bool(
+        question_terms & {"semester", "term", "class", "instruction", "autumn", "fall", "spring", "summer", "session"}
+    )
+    if AI_PROVIDER == "gemini" and (question_terms & {
         "deadline", "due", "project", "assignment", "submit", "submission"
-    }:
+    } or asks_for_academic_date):
         return {"answer": _local_calendar_answer(question, sources), "sources": sources}
 
     evidence = "\n\n".join(
