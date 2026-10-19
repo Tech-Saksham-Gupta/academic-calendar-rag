@@ -14,17 +14,38 @@ const elements = {
   toast: document.getElementById('toast'),
 };
 
+let toastTimer;
+let uploadInProgress = false;
+let questionInProgress = false;
+
 function showToast(message) {
   elements.toast.textContent = message;
   elements.toast.classList.add('show');
-  setTimeout(() => elements.toast.classList.remove('show'), 3000);
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => elements.toast.classList.remove('show'), 4000);
 }
 
 async function request(url, options = {}) {
-  const response = await fetch(url, options);
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.detail || 'Something went wrong. Please try again.');
-  return data;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 120000);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    const text = await response.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch (error) { /* Use a friendly error below. */ }
+    if (!response.ok) throw new Error(data.detail || 'The service could not complete that request. Please try again.');
+    return data;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error('This is taking longer than expected. The request was stopped; please try again with a smaller PDF.');
+    }
+    if (error instanceof TypeError) {
+      throw new Error('The website could not reach its server. Refresh the page and try again.');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function refreshDocuments() {
@@ -46,8 +67,11 @@ function escapeHtml(text) {
 }
 
 async function uploadFiles(files) {
+  if (uploadInProgress) return;
   const pdfs = Array.from(files).filter((file) => file.name.toLowerCase().endsWith('.pdf'));
   if (!pdfs.length) return showToast('Choose a PDF calendar to upload.');
+  uploadInProgress = true;
+  elements.files.disabled = true;
   elements.progress.hidden = false;
   try {
     for (let index = 0; index < pdfs.length; index += 1) {
@@ -57,7 +81,6 @@ async function uploadFiles(files) {
       const result = await request('/api/documents', { method: 'POST', body: formData });
       showToast(`${result.filename} added to your calendar library.`);
     }
-    await refreshDocuments();
     document.getElementById('statusDot').className = 'status-dot ready';
     document.getElementById('statusText').textContent = 'Ready to help';
   } catch (error) {
@@ -66,6 +89,8 @@ async function uploadFiles(files) {
     elements.progress.hidden = true;
     elements.uploadMessage.textContent = '';
     elements.files.value = '';
+    elements.files.disabled = false;
+    uploadInProgress = false;
     try { await refreshDocuments(); } catch (refreshError) { /* Keep the upload result visible. */ }
   }
 }
@@ -78,8 +103,7 @@ function addMessage(role, text, sources = []) {
   if (role === 'user') {
     message.innerHTML = `<div class="message-body"><div class="message-label">YOU</div><div class="message-text">${safeText}</div></div>`;
   } else {
-    const sourceCards = sources.length ? `<div class="source-grid">${sources.map((source, index) => `<div class="source-card"><div class="source-meta">SOURCE ${index + 1} · ${escapeHtml(source.filename)} · PAGE ${source.page}</div><div class="source-text">${escapeHtml(source.text)}</div></div>`).join('')}</div>` : '';
-    message.innerHTML = `<div class="message-avatar">✳</div><div class="message-body"><div class="message-label">CALENDAR ASSISTANT</div><div class="message-text">${safeText}</div>${sourceCards}</div>`;
+    message.innerHTML = `<div class="message-avatar">✳</div><div class="message-body"><div class="message-label">CALENDAR ASSISTANT</div><div class="message-text">${safeText}</div></div>`;
   }
   elements.messages.appendChild(message);
   elements.conversation.scrollTop = elements.conversation.scrollHeight;
@@ -88,7 +112,8 @@ function addMessage(role, text, sources = []) {
 
 async function askQuestion(question) {
   const cleanQuestion = question.trim();
-  if (!cleanQuestion) return;
+  if (!cleanQuestion || questionInProgress) return;
+  questionInProgress = true;
   elements.input.value = '';
   elements.input.style.height = 'auto';
   addMessage('user', cleanQuestion);
@@ -109,6 +134,7 @@ async function askQuestion(question) {
     waiting.remove();
     addMessage('assistant', error.message);
   } finally {
+    questionInProgress = false;
     elements.send.disabled = false;
     elements.input.focus();
   }
