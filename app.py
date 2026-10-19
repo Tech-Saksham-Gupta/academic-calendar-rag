@@ -2,6 +2,7 @@
 
 import logging
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -22,8 +23,14 @@ app = FastAPI(title="Academic Calendar Assistant")
 app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")
 
 
+class ChatTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=1_500)
+
+
 class Question(BaseModel):
     question: str = Field(min_length=1, max_length=1_000)
+    history: list[ChatTurn] = Field(default_factory=list, max_length=8)
 
 
 @app.get("/")
@@ -78,7 +85,7 @@ def chat(payload: Question):
     if not question:
         raise HTTPException(status_code=400, detail="Please enter a question.")
     try:
-        result = answer_question(question)
+        result = answer_question(question, [turn.model_dump() for turn in payload.history])
         result["suggestions"] = suggest_follow_up_questions(question)
         return result
     except RuntimeError as error:
