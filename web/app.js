@@ -64,7 +64,9 @@ async function uploadFiles(files) {
     showToast(error.message);
   } finally {
     elements.progress.hidden = true;
+    elements.uploadMessage.textContent = '';
     elements.files.value = '';
+    try { await refreshDocuments(); } catch (refreshError) { /* Keep the upload result visible. */ }
   }
 }
 
