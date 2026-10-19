@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css" />
+  <link rel="stylesheet" href="/static/styles.css?v=3" />
 </head>
 <body>
   <div class="app-shell">
@@ -27,7 +27,7 @@
       <div class="help-card">
         <div class="help-icon">✦</div>
         <strong>Answers you can trust</strong>
-        <p>Every answer is grounded in your uploaded calendar, with page references included.</p>
+        <p>Answers use your uploaded calendar. If a date is not listed, the assistant says so.</p>
       </div>
       <div class="profile-row"><div class="avatar">CC</div><div><strong>Calendar workspace</strong><small>Personal library</small></div><span class="profile-dots">···</span></div>
     </aside>
@@ -54,8 +54,8 @@
       </section>
 
       <footer class="composer-wrap">
-        <form class="composer" id="chatForm"><textarea id="questionInput" rows="1" placeholder="Ask about dates, deadlines, exams…" aria-label="Ask a question"></textarea><div class="composer-bottom"><span class="composer-hint"><kbd>Enter</kbd> to send <span>·</span> <kbd>Shift + Enter</kbd> for a new line</span><button class="send-button" type="submit" aria-label="Send question"><svg viewBox="0 0 24 24" fill="none"><path d="M12 19V5M6 11l6-6 6 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div></form>
-        <div class="disclaimer">AI can make mistakes. Check the cited calendar page for important dates.</div>
+        <form class="composer" id="chatForm"><textarea id="questionInput" rows="1" maxlength="1000" placeholder="Ask about dates, deadlines, exams…" aria-label="Ask a question"></textarea><div class="composer-bottom"><span class="composer-hint"><kbd>Enter</kbd> to send <span>·</span> <kbd>Shift + Enter</kbd> for a new line</span><button class="send-button" type="submit" aria-label="Send question"><svg viewBox="0 0 24 24" fill="none"><path d="M12 19V5M6 11l6-6 6 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div></form>
+          <div class="disclaimer">AI can make mistakes. Confirm important dates with your registrar or instructor.</div>
       </footer>
     </main>
 
@@ -71,6 +71,6 @@
     </aside>
   </div>
   <div class="toast" id="toast" role="status"></div>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=3"></script>
 </body>
 </html>
