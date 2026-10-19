@@ -95,7 +95,7 @@ async function uploadFiles(files) {
   }
 }
 
-function addMessage(role, text, sources = []) {
+function addMessage(role, text, sources = [], suggestions = []) {
   elements.welcome.hidden = true;
   const message = document.createElement('div');
   message.className = `message ${role}`;
@@ -104,6 +104,24 @@ function addMessage(role, text, sources = []) {
     message.innerHTML = `<div class="message-body"><div class="message-label">YOU</div><div class="message-text">${safeText}</div></div>`;
   } else {
     message.innerHTML = `<div class="message-avatar">✳</div><div class="message-body"><div class="message-label">CALENDAR ASSISTANT</div><div class="message-text">${safeText}</div></div>`;
+    const body = message.querySelector('.message-body');
+    if (Array.isArray(suggestions) && suggestions.length) {
+      const followUps = document.createElement('div');
+      followUps.className = 'follow-up-list';
+      const label = document.createElement('div');
+      label.className = 'follow-up-label';
+      label.textContent = 'YOU COULD ALSO ASK';
+      followUps.appendChild(label);
+      suggestions.forEach((question) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'follow-up-question';
+        button.dataset.question = question;
+        button.textContent = question;
+        followUps.appendChild(button);
+      });
+      body.appendChild(followUps);
+    }
   }
   elements.messages.appendChild(message);
   elements.conversation.scrollTop = elements.conversation.scrollHeight;
@@ -129,7 +147,7 @@ async function askQuestion(question) {
       body: JSON.stringify({ question: cleanQuestion }),
     });
     waiting.remove();
-    addMessage('assistant', result.answer, result.sources);
+    addMessage('assistant', result.answer, result.sources, result.suggestions);
   } catch (error) {
     waiting.remove();
     addMessage('assistant', error.message);
@@ -143,6 +161,10 @@ async function askQuestion(question) {
 elements.form.addEventListener('submit', (event) => {
   event.preventDefault();
   askQuestion(elements.input.value);
+});
+elements.messages.addEventListener('click', (event) => {
+  const button = event.target.closest('.follow-up-question');
+  if (button) askQuestion(button.dataset.question);
 });
 elements.input.addEventListener('keydown', (event) => {
   if (event.key === 'Enter' && !event.shiftKey) {
