@@ -1165,10 +1165,6 @@ def answer_question(question, history=None):
     is_calendar_request = _is_calendar_question(effective_question)
     asks_all_dates = _asks_for_all_dates(effective_question)
     sources = [] if asks_all_dates else retrieve(effective_question)
-    # Send every user turn to the configured chat API. Retrieval is only useful
-    # for calendar questions; greetings and unrelated requests go to the model
-    # without calendar passages, with scope rules in the system instruction.
-    sources = retrieve(effective_question) if is_calendar_request and not (asks_all_dates or is_greeting) else []
     full_calendar_sources = [
         {"filename": filename, "page": page_number, "text": page_text}
         for _, filename, page_number, page_text in _all_calendar_pages()
@@ -1178,7 +1174,16 @@ def answer_question(question, history=None):
             "answer": _local_calendar_answer(effective_question, []),
             "sources": [],
         }
-    ] if is_calendar_request and not is_greeting else []
+    # Send every user turn to the configured chat API. Retrieval is only useful
+    # for calendar questions; greetings and unrelated requests go to the model
+    # without calendar passages, with scope rules in the system instruction.
+    sources = retrieve(effective_question) if is_calendar_request and not (asks_all_dates or is_greeting) else []
+    full_calendar_sources = []
+    if is_calendar_request and not is_greeting:
+        full_calendar_sources = [
+            {"filename": filename, "page": page_number, "text": page_text}
+            for _, filename, page_number, page_text in _all_calendar_pages()
+        ]
     question_terms = set(_search_terms(effective_question))
     # Gemini gets first opportunity to answer from retrieved evidence. Broad
     # The configured chat model gets first opportunity to answer from evidence. Broad
