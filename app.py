@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
-from rag import ai_status, answer_question, get_documents, index_pdf, remove_document
+from rag import ai_status, answer_question, get_documents, index_pdf, remove_document, suggest_follow_up_questions
 
 BASE_DIR = Path(__file__).parent
 WEB_DIR = BASE_DIR / "web"
@@ -78,7 +78,9 @@ def chat(payload: Question):
     if not question:
         raise HTTPException(status_code=400, detail="Please enter a question.")
     try:
-        return answer_question(question)
+        result = answer_question(question)
+        result["suggestions"] = suggest_follow_up_questions(question)
+        return result
     except RuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
     except Exception as error:
