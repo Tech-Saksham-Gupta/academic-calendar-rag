@@ -1,102 +1,76 @@
 # Campus Calendar — Academic Calendar Assistant
 
-A responsive website that answers questions from academic calendar PDFs and shows the pages used as evidence. It uses **RAG (retrieval-augmented generation)**: PDF pages are split into passages, converted into meaning-based embeddings, searched for relevant passages, and passed to an AI model to write an answer with sources.
+A small, public website that searches uploaded academic-calendar PDFs and answers questions about dates. It uses retrieval-augmented generation (RAG): the app retrieves calendar passages first, then uses those passages to answer. On Render, retrieval is local BM25 search and Gemini is used only to write the answer. If Gemini is unavailable, a short answer is built from matching calendar text.
 
-## Two ways to run it
+## Important limits before deployment
 
-| Where | AI provider | Cost | Important detail |
-|---|---|---|---|
-| Your computer | Ollama | No API fee | Uses your computer's memory, storage, and electricity. |
-| Render Free | Gemini API free tier | Can be $0 within the free limits | The service sleeps when idle, and uploaded calendars can disappear when it restarts. Google's free tier may use submitted content to improve its products. |
+- Render Free sleeps after 15 minutes without traffic. The first visit after sleep can take about a minute.
+- Render Free has an ephemeral filesystem. Uploaded calendars and the local SQLite database are lost when the service sleeps, restarts, or redeploys. Users may need to upload calendars again.
+- This is one shared public workspace: visitors can see and remove calendars uploaded to the site. Do not upload private or sensitive documents.
+- Gemini's free API has changing quotas and outages. The app falls back to retrieved calendar text when answer generation fails, but no free hosting or API can guarantee uninterrupted service.
+- If a calendar does not contain a requested project deadline, the assistant says it is not listed rather than inventing a date.
 
-Gemini's free quota and available models can change. Keep the Google project on its free tier and do not enable billing if you want to avoid API charges. Do not upload private or sensitive records to the Gemini free tier.
+For persistent files, a paid Render service with a persistent disk is needed. A persistent database is another option, but free database plans can have their own limits and expiration policies.
 
-## Project files
+## Files
 
 ```text
 academic-calendar-assistant/
-├── .env.example       # Example settings; never put a real key here
-├── .gitignore         # Keeps secrets and local database out of Git
+├── .env.example       # Example local settings; never put a real key here
+├── .gitignore         # Keeps secrets and local data out of Git
 ├── README.md          # This guide
-├── app.py             # Website server and API routes
-├── rag.py              # PDF reading, embeddings, retrieval, and answers
-├── render.yaml         # Free Render deployment setup
-├── requirements.txt    # Python packages
+├── app.py             # FastAPI website and upload/chat routes
+├── rag.py             # PDF extraction, retrieval, and grounded answers
+├── render.yaml        # Public Render Free deployment settings
+├── requirements.txt   # Python packages
+├── tests/
+│   └── test_rag.py    # Offline reliability checks
 └── web/
-    ├── app.js          # Upload, chat, and source interactions
-    ├── index.html      # Website page structure
-    └── styles.css      # Website design
+    ├── app.js         # Upload, chat, timeout, and progress behavior
+    ├── index.html     # Website structure
+    └── styles.css     # Website styling
 ```
 
 ## Run locally with Ollama
 
-You already have Python and the Python packages installed. Open the `academic-calendar-assistant` folder in VS Code, then open **Terminal → New Terminal**. Keep Ollama running, and download both models once:
+1. Open this folder in VS Code and open **Terminal → New Terminal**.
+2. Keep Ollama running and download the models once:
 
-```powershell
-ollama pull llama3.2:3b
-ollama pull nomic-embed-text
-```
+   ```powershell
+   ollama pull llama3.2:3b
+   ollama pull nomic-embed-text
+   ```
 
-If PowerShell says `ollama` is not recognized, use the full path (as you did earlier):
+3. Start the website:
 
-```powershell
-& "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" pull llama3.2:3b
-& "$env:LOCALAPPDATA\Programs\Ollama\ollama.exe" pull nomic-embed-text
-```
+   ```powershell
+   .\.venv\Scripts\python.exe -m uvicorn app:app --reload
+   ```
 
-Then start the website:
-
-```powershell
-.\.venv\Scripts\python.exe -m uvicorn app:app --reload
-```
-
-Open `http://127.0.0.1:8000` in your browser. Upload a text-based academic calendar PDF and ask a question. Scanned image-only PDFs need OCR before this app can read them.
+4. Open `http://127.0.0.1:8000` and upload a text-based academic calendar PDF. Image-only scans need OCR first.
 
 ## Deploy on Render Free
 
-This option runs the website on Render Free and uses Google's Gemini API free tier for embeddings and answers. Ollama is not needed on Render.
+1. Upload the project files to the top level of a GitHub repository. The `render.yaml` file must be beside `app.py`.
+2. In Render, create a **Blueprint** from that repository.
+3. When asked for `GEMINI_API_KEY`, enter the key from Google AI Studio. Keep it in Render's secret environment settings; never commit it to GitHub.
+4. Wait for the service to show **Live**, then open its public `onrender.com` link.
 
-### 1. Create a free Gemini API key
+The blueprint intentionally has no website username or password. Anyone with the link can use the shared site and shared calendar library.
 
-1. Open [Google AI Studio API keys](https://aistudio.google.com/apikey) and sign in.
-2. Create an API key for a free-tier project. Do not link billing if you want to keep API use free.
-3. Keep the key private. Never paste it into `rag.py`, `app.py`, or a public GitHub repository.
+## Test the project
 
-Google's [Gemini API pricing page](https://ai.google.dev/gemini-api/docs/pricing) lists which models have free-tier use. The currently configured models are `gemini-2.5-flash-lite` for answers and `gemini-embedding-2` for retrieval embeddings. Free-tier limits and availability may change.
+Run the automated checks from the project folder:
 
-### 2. Put the project on GitHub
+```powershell
+python -m unittest discover -s tests -v
+```
 
-1. Create a new GitHub repository.
-2. Upload the **contents** of the `academic-calendar-assistant` folder to the repository's top level. `render.yaml` should be visible at the top level, beside `app.py`.
-3. Do not upload your `.venv` folder or any `.env` file with a real key.
+The 26 offline checks cover short and long text chunking, PDF extraction errors, scanned/locked/oversized PDFs, retrieval relevance, date formats and table text, missing deadlines, Gemini outages and malformed replies, upload validation, document deletion, and the upload progress indicator.
 
-### 3. Create the Render service
+## Settings
 
-1. Sign in to [Render](https://render.com).
-2. Choose **New → Blueprint** and connect your GitHub repository.
-3. Review the service. The provided `render.yaml` selects the **Free** plan and Singapore region.
-4. When Render asks for `GEMINI_API_KEY`, paste your key there. Render stores it as a secret environment value.
-5. Create the service and wait for the first deployment to finish.
-6. Open the `onrender.com` link. The username is `calendar-admin`; find the generated password on the service's **Environment** page.
-
-### Free hosting limits
-
-- Render Free sleeps after 15 minutes without incoming requests. The first visit after that can take about a minute to load.
-- Render Free storage is temporary. Uploaded calendar passages are erased if the service restarts, sleeps, or redeploys. Upload your calendar again when it is missing.
-- Google Gemini free API use has rate and usage limits. If you reach one, wait for the quota to reset or use local Ollama instead.
-- Google's pricing page says content sent through the free tier may be used to improve Google products. Use local Ollama for documents you do not want to send to a hosted AI provider.
-
-## How the RAG flow works
-
-1. **Extract:** `pypdf` reads selectable text from each page of the PDF.
-2. **Split:** the app divides text into overlapping passages and keeps the original page number.
-3. **Embed:** Ollama or Gemini converts each passage into a numeric meaning vector.
-4. **Retrieve:** the app embeds the question and compares vectors to find the most relevant passages.
-5. **Generate:** the chosen model gets only the question and retrieved evidence. The website shows the answer and source page cards.
-
-## Local files and settings
-
-- The local SQLite database is created at `data/calendar.db` after the first PDF upload.
-- Copy `.env.example` to `.env` only if you want to change settings. For local Ollama, the default `AI_PROVIDER=ollama` works without an API key.
-- For Gemini locally, set `AI_PROVIDER=gemini` and put your key in `GEMINI_API_KEY` in your private `.env` file. Do not upload `.env` to GitHub.
-- The upload limit is 20 MB per PDF. The app stores extracted passages and their embeddings, not the original PDF file.
+- Local Ollama is the default provider. For Render, `render.yaml` sets `AI_PROVIDER=gemini`.
+- `GEMINI_API_KEY` belongs in Render's environment settings or a private local `.env` file. Never expose it in frontend code or a public repository.
+- PDFs must be unlocked, text-readable, no larger than 20 MB, and no more than 500 pages.
+- The local database is created at `data/calendar.db`.
