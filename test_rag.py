@@ -275,7 +275,14 @@ class RagChecks(unittest.TestCase):
             "March 15-19, 2027\nSpring recess\nNo classes.\n"
         )
         os.environ["GEMINI_API_KEY"] = "test-key"
-        with patch.object(rag.requests, "post", side_effect=AssertionError("Unsupported named event must not be guessed")):
+        class NotFoundResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"candidates": [{"content": {"parts": [{"text": "Sorry, I couldn't find this information in the available academic calendar. Please check the official university website or contact the university administration."}]}}]}
+
+        with patch.object(rag.requests, "post", return_value=NotFoundResponse()):
             result = rag.answer_question(
                 "when is diwali holidays",
                 history=[{"role": "assistant", "content": "Spring midterms are March 8-12, 2027."}],
@@ -444,12 +451,43 @@ class RagChecks(unittest.TestCase):
         self.assertEqual({doc["filename"] for doc in rag.get_documents()}, {"autumn.pdf", "spring.pdf"})
 
     def test_deadline_question_uses_calendar_dates_without_calling_gemini(self):
+    def test_deadline_question_uses_gemini_first_when_configured(self):
         self.add_passage("Project report deadline is October 12, 2026.")
         os.environ["GEMINI_API_KEY"] = "test-key"
         with patch.object(rag.requests, "post", side_effect=AssertionError("This date lookup should stay local")):
+        class GeminiResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"candidates": [{"content": {"parts": [{"text": "The project report is due October 12, 2026. Submit it before the deadline."}]}}]}
+
+        with patch.object(rag.requests, "post", return_value=GeminiResponse()) as generate:
             result = rag.answer_question("What is the deadline to finish my project?")
+        generate.assert_called_once()
         self.assertIn("October 12, 2026", result["answer"])
         self.assertIn("submit early", result["answer"])
+        self.assertIn("Submit it", result["answer"])
+
+    def test_calendar_overview_sends_full_document_to_gemini_after_search_miss(self):
+        self.add_passage("Autumn classes begin August 24, 2026. Spring exams run May 12-14, 2027.")
+        os.environ["GEMINI_API_KEY"] = "test-key"
+
+        class GeminiResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"candidates": [{"content": {"parts": [{"text": "The calendar is organized by semester, with class dates, deadlines, breaks, and exam periods. It covers Autumn 2026 and Spring 2027."}]}}]}
+
+        with patch.object(rag, "retrieve", return_value=[]), patch.object(
+            rag.requests, "post", return_value=GeminiResponse()
+        ) as generate:
+            result = rag.answer_question("Summarize the overall structure of the uploaded academic calendar.")
+        generate.assert_called_once()
+        sent = generate.call_args.kwargs["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("Autumn classes begin August 24, 2026", sent)
+        self.assertIn("organized by semester", result["answer"])
 
     def test_calendar_answer_searches_all_pages_not_only_top_k_retrieval(self):
         for page in range(1, 8):
