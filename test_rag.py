@@ -169,7 +169,27 @@ class RagChecks(unittest.TestCase):
         }
         answer = rag._local_calendar_answer("When do Autumn classes begin?", [source])
         self.assertIn("August 24, 2026", answer)
-        self.assertIn("First day of classes", answer)
+        self.assertIn("Autumn classes begin", answer)
+
+    def test_autumn_start_answer_does_not_mix_in_spring(self):
+        passages = [
+            {"filename": "calendar.pdf", "page": 1, "text": "AUTUMN SEMESTER 2026 Autumn classes begin Monday, August 24, 2026. DATE ACADEMIC EVENT DETAILS August 24, 2026 First day of classes Autumn semester instruction begins. December 11, 2026 Last day of classes Final day of Autumn instruction."},
+            {"filename": "calendar.pdf", "page": 2, "text": "SPRING SEMESTER 2027 Spring classes begin Tuesday, January 19, 2027. January 19, 2027 First day of classes Spring semester instruction begins. May 7, 2027 Last day of classes Final day of Spring instruction."},
+        ]
+        answer = rag._local_calendar_answer("When does Autumn semester begin?", passages)
+        self.assertIn("August 24, 2026", answer)
+        self.assertNotIn("January 19, 2027", answer)
+
+    def test_semester_end_question_returns_end_dates_not_start_dates(self):
+        passages = [
+            {"filename": "calendar.pdf", "page": 1, "text": "AUTUMN SEMESTER 2026 Autumn classes begin Monday, August 24, 2026. December 11, 2026 Last day of classes Final day of Autumn instruction."},
+            {"filename": "calendar.pdf", "page": 2, "text": "SPRING SEMESTER 2027 Spring classes begin Tuesday, January 19, 2027. May 7, 2027 Last day of classes Final day of Spring instruction."},
+        ]
+        answer = rag._local_calendar_answer("When does the semester end?", passages)
+        self.assertIn("December 11, 2026", answer)
+        self.assertIn("May 7, 2027", answer)
+        self.assertNotIn("August 24, 2026", answer)
+        self.assertNotIn("January 19, 2027", answer)
 
     def test_numeric_date_in_deadline_is_recognized(self):
         source = {
