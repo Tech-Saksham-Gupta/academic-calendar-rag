@@ -257,6 +257,33 @@ class RagChecks(unittest.TestCase):
         )
         self.assertIn("autumn semester", expanded.lower())
 
+    def test_named_holiday_question_does_not_inherit_prior_semester(self):
+        question = "when is diwali holidays"
+        expanded = rag._contextualize_follow_up(
+            question,
+            [
+                {"role": "user", "content": "When are Spring midterm assessments?"},
+                {"role": "assistant", "content": "Spring midterms are March 8-12, 2027."},
+            ],
+        )
+        self.assertEqual(expanded, question)
+
+    def test_unsupported_named_holiday_returns_not_found_not_neighboring_dates(self):
+        self.add_passage(
+            "SPRING SEMESTER 2027\n"
+            "February 5, 2027\nSpring tuition adjustment deadline\nLast day for eligible changes.\n"
+            "March 15-19, 2027\nSpring recess\nNo classes.\n"
+        )
+        os.environ["GEMINI_API_KEY"] = "test-key"
+        with patch.object(rag.requests, "post", side_effect=AssertionError("Unsupported named event must not be guessed")):
+            result = rag.answer_question(
+                "when is diwali holidays",
+                history=[{"role": "assistant", "content": "Spring midterms are March 8-12, 2027."}],
+            )
+        self.assertIn("Sorry, I couldn't find this information", result["answer"])
+        self.assertNotIn("February 5", result["answer"])
+        self.assertNotIn("March 15", result["answer"])
+
     def test_days_until_is_calculated_from_the_verified_calendar_date(self):
         sources = [{
             "filename": "calendar.pdf",
