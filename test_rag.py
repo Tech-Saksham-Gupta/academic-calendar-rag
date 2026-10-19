@@ -93,6 +93,19 @@ class RagChecks(unittest.TestCase):
         chunks = rag.split_into_chunks("August 24, 2026\nFirst day of classes\nAutumn begins")
         self.assertEqual(chunks, ["August 24, 2026\nFirst day of classes\nAutumn begins"])
 
+    def test_calendar_table_parser_rejoins_wrapped_cross_year_date_ranges(self):
+        rows = rag._calendar_table_rows(
+            "December 24,\n2026-January 1,\n2027\nWinter university closure\nNo classes.\n",
+            rag.CALENDAR_DATE_PATTERN,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertIn("December 24", rows[0][0])
+        self.assertIn("January 1", rows[0][0])
+        self.assertEqual(rows[0][1], "Winter university closure")
+
+    def test_winter_closure_is_recognized_as_a_calendar_question(self):
+        self.assertTrue(rag._is_calendar_question("When is the winter university closure?"))
+
     def test_all_dates_query_detects_every_and_each_phrasings(self):
         for question in (
             "give each date",
@@ -102,6 +115,23 @@ class RagChecks(unittest.TestCase):
             with self.subTest(question=question):
                 self.assertTrue(rag._asks_for_all_dates(question))
         self.assertFalse(rag._asks_for_all_dates("When is the deadline?"))
+        self.assertFalse(rag._asks_for_all_dates("List every date when classes are not held"))
+
+    def test_no_class_dates_question_uses_category_filtered_events(self):
+        self.add_passage(
+            "AUTUMN SEMESTER 2026\n"
+            "September 7, 2026\nLabor Day\nNo classes; university offices are closed.\n"
+            "September 8, 2026\nClasses resume\nRegular instruction continues.\n"
+            "November 25-27, 2026\nThanksgiving recess\nNo classes.\n"
+        )
+        pages = [
+            {"filename": filename, "page": page, "text": text}
+            for _, filename, page, text in rag._all_calendar_pages()
+        ]
+        answer = rag._local_calendar_answer("List every date when classes are not held", pages)
+        self.assertIn("September 7, 2026", answer)
+        self.assertIn("November 25-27, 2026", answer)
+        self.assertNotIn("September 8, 2026", answer)
 
     def test_all_dates_lists_full_calendar_with_event_titles_and_ranges(self):
         self.add_passage(
@@ -393,6 +423,31 @@ class RagChecks(unittest.TestCase):
             result = rag.answer_question("What is the deadline to finish my project?")
         self.assertIn("October 12, 2026", result["answer"])
         self.assertIn("submit early", result["answer"])
+
+    def test_calendar_answer_searches_all_pages_not_only_top_k_retrieval(self):
+        for page in range(1, 8):
+            text = (
+                "SPRING SEMESTER 2027\n"
+                + ("April 2, 2027\nCourse withdrawal deadline\nLast day to withdraw from a Spring course.\n"
+                   if page == 7 else f"Page {page} general spring calendar information.\n")
+            )
+            self.add_passage(text, page=page)
+        with patch.object(rag, "retrieve", return_value=[
+            {"filename": "calendar.pdf", "page": 1, "text": "General spring information."}
+        ]):
+            result = rag.answer_question("When is the spring course withdrawal deadline?")
+        self.assertIn("April 2, 2027", result["answer"])
+
+    def test_days_before_comparative_question_uses_both_calendar_dates(self):
+        self.add_passage(
+            "SPRING SEMESTER 2027\n"
+            "January 11, 2027\nSpring tuition and fees due\nPay by the posted deadline.\n"
+            "January 19, 2027\nFirst day of classes\nSpring semester instruction begins.\n"
+        )
+        os.environ.pop("GEMINI_API_KEY", None)
+        with patch.object(rag.requests, "post", side_effect=AssertionError("Date comparison stays local")):
+            result = rag.answer_question("How many days before spring classes begin is tuition due?")
+        self.assertIn("8 days before", result["answer"])
 
     def test_gemini_success_is_trimmed_to_two_sentences_and_no_source_labels(self):
         self.add_passage("Autumn classes begin Monday, August 24, 2026.")
