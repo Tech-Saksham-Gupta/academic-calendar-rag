@@ -1,10 +1,12 @@
 """Readable RAG pipeline with either local Ollama or free-tier Gemini models."""
 
 import json
+import math
 import os
 import re
 import sqlite3
 import uuid
+from collections import Counter
 from io import BytesIO
 from pathlib import Path
 
@@ -140,7 +142,12 @@ def index_pdf(filename, pdf_bytes):
         # Small batches make large calendar PDFs more reliable to process.
         for batch_start in range(0, len(passages), 64):
             batch = passages[batch_start : batch_start + 64]
-            vectors = make_embeddings([text for _, text in batch])
+            # Gemini's embedding endpoint can have strict free-tier quotas.
+            # Use local BM25 retrieval with Gemini so indexing needs no API call.
+            if AI_PROVIDER == "gemini":
+                vectors = [[] for _ in batch]
+            else:
+                vectors = make_embeddings([text for _, text in batch])
             connection.executemany(
                 "INSERT INTO passages VALUES (?, ?, ?, ?, ?, ?)",
                 [
@@ -176,12 +183,50 @@ def remove_document(document_id):
 
 
 def retrieve(question):
-    """Find the passages whose embeddings are closest to the question."""
+    """Find relevant passages using local BM25 or Ollama embeddings."""
     connection = connect_database()
     rows = connection.execute("SELECT filename, page, text, embedding FROM passages").fetchall()
     connection.close()
     if not rows:
         return []
+
+    if AI_PROVIDER == "gemini":
+        # BM25 is a simple local search method. It keeps PDF indexing and
+        # retrieval available even when Gemini embedding quotas are exhausted.
+        tokenized = [_search_terms(row["text"]) for row in rows]
+        query_terms = _search_terms(question)
+        document_frequency = Counter(
+            term for terms in tokenized for term in set(terms)
+        )
+        average_length = sum(map(len, tokenized)) / max(len(tokenized), 1)
+        scores = []
+        for row, terms in zip(rows, tokenized):
+            counts = Counter(terms)
+            score = 0.0
+            for term in query_terms:
+                frequency = counts[term]
+                if not frequency:
+                    continue
+                inverse_frequency = math.log(
+                    1 + (len(rows) - document_frequency[term] + 0.5)
+                    / (document_frequency[term] + 0.5)
+                )
+                length_factor = frequency + 1.2 * (
+                    1 - 0.75 + 0.75 * len(terms) / max(average_length, 1)
+                )
+                score += inverse_frequency * frequency * 2.2 / length_factor
+            scores.append(score)
+        best_indexes = sorted(range(len(scores)), key=scores.__getitem__, reverse=True)[:RESULT_COUNT]
+        return [
+            {
+                "filename": rows[index]["filename"],
+                "page": rows[index]["page"],
+                "text": rows[index]["text"],
+                "score": float(scores[index]),
+            }
+            for index in best_indexes
+            if scores[index] > 0
+        ]
 
     question_vector = np.array(make_embeddings([question])[0], dtype=np.float32)
     passage_vectors = np.array([json.loads(row["embedding"]) for row in rows], dtype=np.float32)
@@ -199,6 +244,15 @@ def retrieve(question):
         }
         for index in best_indexes
         if scores[index] > 0.15
+    ]
+
+
+def _search_terms(text):
+    """Normalize words for local calendar search."""
+    common_words = {"the", "and", "for", "are", "does", "when", "what", "which", "is", "of", "to", "in", "on", "a", "an"}
+    return [
+        word for word in re.findall(r"[a-z0-9]+", text.lower())
+        if len(word) > 1 and word not in common_words
     ]
 
 
@@ -226,17 +280,26 @@ def answer_question(question):
         if not api_key:
             raise RuntimeError("Gemini is selected, but GEMINI_API_KEY is not set.")
         model = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.5-flash-lite")
-        response = requests.post(
-            f"{GEMINI_API_URL}/{model}:generateContent",
-            headers={"x-goog-api-key": api_key},
-            json={
-                "systemInstruction": {"parts": [{"text": instruction}]},
-                "contents": [{"parts": [{"text": f"Question: {question}\n\nSources:\n{evidence}"}]}],
-                "generationConfig": {"temperature": 0.1},
-            },
-            timeout=180,
-        )
-        response.raise_for_status()
+        try:
+            response = requests.post(
+                f"{GEMINI_API_URL}/{model}:generateContent",
+                headers={"x-goog-api-key": api_key},
+                json={
+                    "systemInstruction": {"parts": [{"text": instruction}]},
+                    "contents": [{"parts": [{"text": f"Question: {question}\n\nSources:\n{evidence}"}]}],
+                    "generationConfig": {"temperature": 0.1},
+                },
+                timeout=180,
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            # Still return the retrieved calendar evidence if the free AI
+            # endpoint is temporarily unavailable or over its quota.
+            return {
+                "answer": "Gemini is temporarily rate-limited. Here is the matching calendar text: "
+                + " ".join(source["text"] for source in sources),
+                "sources": sources,
+            }
         answer = response.json()["candidates"][0]["content"]["parts"][0]["text"]
     else:
         response = requests.post(
