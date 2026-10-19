@@ -17,6 +17,7 @@ const elements = {
 let toastTimer;
 let uploadInProgress = false;
 let questionInProgress = false;
+let conversationHistory = [];
 
 function showToast(message) {
   elements.toast.textContent = message;
@@ -66,6 +67,23 @@ function escapeHtml(text) {
   return String(text).replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]);
 }
 
+function formatAnswer(text) {
+  const safe = escapeHtml(text);
+  const months = 'January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec';
+  const datePattern = new RegExp(`\\b(?:${months})\\s+\\d{1,2}(?:st|nd|rd|th)?(?:\\s*[-–—]\\s*\\d{1,2})?(?:,?\\s+\\d{4})?|\\b\\d{1,2}[/-]\\d{1,2}[/-]\\d{2,4}\\b`, 'gi');
+  return safe.replace(datePattern, '<strong>$&</strong>').replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+}
+
+function sourceCitation(sources) {
+  const pagesByFile = new Map();
+  (sources || []).forEach((source) => {
+    if (!source.filename || !source.page) return;
+    if (!pagesByFile.has(source.filename)) pagesByFile.set(source.filename, new Set());
+    pagesByFile.get(source.filename).add(source.page);
+  });
+  return Array.from(pagesByFile, ([filename, pages]) => `${filename}, page${pages.size > 1 ? 's' : ''} ${Array.from(pages).sort((a, b) => a - b).join(', ')}`).join(' · ');
+}
+
 async function uploadFiles(files) {
   if (uploadInProgress) return;
   const pdfs = Array.from(files).filter((file) => file.name.toLowerCase().endsWith('.pdf'));
@@ -99,12 +117,19 @@ function addMessage(role, text, sources = [], suggestions = []) {
   elements.welcome.hidden = true;
   const message = document.createElement('div');
   message.className = `message ${role}`;
-  const safeText = escapeHtml(text);
+  const safeText = formatAnswer(text);
   if (role === 'user') {
     message.innerHTML = `<div class="message-body"><div class="message-label">YOU</div><div class="message-text">${safeText}</div></div>`;
   } else {
     message.innerHTML = `<div class="message-avatar">✳</div><div class="message-body"><div class="message-label">CALENDAR ASSISTANT</div><div class="message-text">${safeText}</div></div>`;
     const body = message.querySelector('.message-body');
+    const citation = sourceCitation(sources);
+    if (citation) {
+      const sourceLine = document.createElement('div');
+      sourceLine.className = 'answer-source';
+      sourceLine.textContent = `Source: ${citation}`;
+      body.appendChild(sourceLine);
+    }
     if (Array.isArray(suggestions) && suggestions.length) {
       const followUps = document.createElement('div');
       followUps.className = 'follow-up-list';
@@ -144,10 +169,12 @@ async function askQuestion(question) {
   try {
     const result = await request('/api/chat', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question: cleanQuestion }),
+      body: JSON.stringify({ question: cleanQuestion, history: conversationHistory.slice(-8) }),
     });
     waiting.remove();
     addMessage('assistant', result.answer, result.sources, result.suggestions);
+    conversationHistory.push({ role: 'user', content: cleanQuestion.slice(0, 1_500) });
+    conversationHistory.push({ role: 'assistant', content: String(result.answer).slice(0, 1_500) });
   } catch (error) {
     waiting.remove();
     addMessage('assistant', error.message);
@@ -195,6 +222,7 @@ elements.library.addEventListener('click', async (event) => {
 });
 document.getElementById('clearChatButton').addEventListener('click', () => {
   elements.messages.innerHTML = '';
+  conversationHistory = [];
   elements.welcome.hidden = false;
 });
 document.getElementById('newChatButton').addEventListener('click', () => document.getElementById('clearChatButton').click());
