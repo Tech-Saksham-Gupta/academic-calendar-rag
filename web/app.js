@@ -74,16 +74,6 @@ function formatAnswer(text) {
   return safe.replace(datePattern, '<strong>$&</strong>').replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
 }
 
-function sourceCitation(sources) {
-  const pagesByFile = new Map();
-  (sources || []).forEach((source) => {
-    if (!source.filename || !source.page) return;
-    if (!pagesByFile.has(source.filename)) pagesByFile.set(source.filename, new Set());
-    pagesByFile.get(source.filename).add(source.page);
-  });
-  return Array.from(pagesByFile, ([filename, pages]) => `${filename}, page${pages.size > 1 ? 's' : ''} ${Array.from(pages).sort((a, b) => a - b).join(', ')}`).join(' · ');
-}
-
 async function uploadFiles(files) {
   if (uploadInProgress) return;
   const pdfs = Array.from(files).filter((file) => file.name.toLowerCase().endsWith('.pdf'));
@@ -123,13 +113,6 @@ function addMessage(role, text, sources = [], suggestions = []) {
   } else {
     message.innerHTML = `<div class="message-avatar">✳</div><div class="message-body"><div class="message-label">CALENDAR ASSISTANT</div><div class="message-text">${safeText}</div></div>`;
     const body = message.querySelector('.message-body');
-    const citation = sourceCitation(sources);
-    if (citation) {
-      const sourceLine = document.createElement('div');
-      sourceLine.className = 'answer-source';
-      sourceLine.textContent = `Source: ${citation}`;
-      body.appendChild(sourceLine);
-    }
     if (Array.isArray(suggestions) && suggestions.length) {
       const followUps = document.createElement('div');
       followUps.className = 'follow-up-list';
