@@ -446,15 +446,30 @@ def _contextualize_follow_up(question, history):
     terms = set(_search_terms(question))
     if terms & {"autumn", "fall", "spring", "summer"}:
         return question
+    vague_reference = bool(re.search(r"\b(it|that|those|they|then|there|same)\b", question.lower()))
+    generic_query_terms = {
+        "when", "what", "which", "where", "does", "do", "is", "are", "the", "a", "an", "in", "on", "for", "to", "from", "and", "with", "should", "can", "i", "me", "my", "this", "that", "of", "all", "every", "each", "list", "listed", "important", "date", "dates", "day", "days", "semester", "term", "academic", "calendar", "class", "classes", "course", "exam", "exams", "final", "midterm", "assessment", "deadline", "deadlines", "due", "registration", "register", "enrollment", "enroll", "fee", "fees", "tuition", "payment", "installment", "holiday", "holidays", "break", "recess", "vacation", "closed", "closure", "office", "offices", "university", "begin", "begins", "start", "starts", "end", "ends", "finish", "last", "open", "opens", "occur", "occurs", "happen", "happens", "fall", "remain", "remaining", "left", "until", "coming", "upcoming",
+        "autumn", "spring", "summer", "winter", "labor", "thanksgiving", "martin", "luther", "king", "jr", "juneteenth", "independence", "presidents", "indigenous", "founders", "commencement", "graduation", "orientation", "project", "proposal", "capstone", "assignment", "withdraw", "withdrawal", "add", "drop",
+    }
+    has_named_topic = bool(terms - generic_query_terms)
     context = " ".join(
         turn.get("content", "") for turn in (history or [])[-8:]
         if turn.get("role") in {"user", "assistant"}
     )
     season = next((word for word in re.findall(r"\bautumn\b|\bfall\b|\bspring\b|\bsummer\b", context.lower())[::-1]), None)
-    if season and (terms & {"end", "finish", "begin", "start", "exam", "deadline", "date", "holiday", "break"} or re.search(r"\b(it|that|those|they|then|there)\b", question.lower())):
+    if season and (vague_reference or (not has_named_topic and terms & {"end", "finish", "begin", "start", "exam", "deadline", "date", "holiday", "break"})):
         name = "autumn" if season == "fall" else season
         return f"{question} {name} semester"
     return question
+
+
+def _named_holiday_terms(question):
+    """Return specific holiday/event words, excluding generic query wording."""
+    terms = set(_search_terms(question))
+    generic = {
+        "when", "what", "which", "does", "do", "is", "are", "the", "a", "an", "in", "on", "for", "to", "from", "and", "with", "should", "can", "i", "me", "my", "this", "that", "there", "of", "all", "every", "each", "list", "listed", "important", "date", "dates", "day", "days", "holiday", "holidays", "break", "recess", "vacation", "closed", "closure", "office", "offices", "university", "campus", "occur", "occurs", "happen", "happens", "fall", "observe", "observed", "celebrate", "celebrated", "held", "class", "classes", "no", "year", "academic", "calendar", "autumn", "spring", "summer", "winter",
+    }
+    return terms - generic
 
 
 def _is_calendar_question(question):
@@ -1014,7 +1029,10 @@ def _local_calendar_answer(question, sources):
         if asks_graduation and not title_words & {"graduation", "graduate", "commencement", "application"}:
             continue
         if asks_holiday:
+            holiday_topics = _named_holiday_terms(question)
             if not words & {"holiday", "recess", "break", "vacation", "closed", "closure", "day", "study"}:
+                continue
+            if holiday_topics and not holiday_topics <= words:
                 continue
             title_words = set(_search_terms(title))
             named_holiday_terms = original & holiday_names
@@ -1160,6 +1178,12 @@ def answer_question(question, history=None):
     local_answer = _local_calendar_answer(effective_question, calendar_evidence)
     if not local_answer.startswith("Sorry, I couldn't find this information"):
         return {"answer": local_answer, "sources": sources}
+    # Do not send a named but unsupported holiday to a generative fallback:
+    # retrieved neighboring dates could otherwise be presented as an answer.
+    if _named_holiday_terms(effective_question) and set(question_terms) & {
+        "holiday", "holidays", "break", "recess", "vacation", "closed", "closure"
+    }:
+        return {"answer": local_answer, "sources": []}
     asks_for_academic_date = bool(question_terms & {"begin", "start", "first", "end", "finish", "conclude"}) and bool(
         question_terms & {"semester", "term", "class", "instruction", "autumn", "fall", "spring", "summer", "session"}
     )
