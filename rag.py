@@ -256,6 +256,48 @@ def _search_terms(text):
     ]
 
 
+def _local_calendar_answer(question, sources):
+    """Give a short, cited answer from the calendar if Gemini is unavailable."""
+    terms = set(_search_terms(question))
+    expansions = {
+        "semester": {"term", "classes", "instruction"},
+        "begin": {"begins", "start", "starts", "first", "day"},
+        "start": {"starts", "begins", "first", "day"},
+        "exam": {"exams", "final", "midterm", "assessment"},
+        "holiday": {"holidays", "closure", "closed", "recess"},
+        "withdraw": {"withdrawal", "drop", "deadline"},
+    }
+    for term in list(terms):
+        terms.update(expansions.get(term, set()))
+
+    candidates = []
+    for source_number, source in enumerate(sources, start=1):
+        sentences = re.split(r"(?<=[.!?])\s+|\n+", source["text"])
+        for sentence in sentences:
+            sentence = sentence.strip(" -|\t")
+            sentence_terms = set(_search_terms(sentence))
+            overlap = len(terms & sentence_terms)
+            if overlap:
+                candidates.append((overlap / max(len(sentence_terms) ** 0.35, 1), sentence, source_number))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    if not candidates:
+        source = sources[0]
+        excerpt = source["text"][:260].rsplit(" ", 1)[0]
+        return f"I found this detail in your calendar: {excerpt}. [Source 1]"
+
+    chosen = []
+    seen = set()
+    for _, sentence, source_number in candidates:
+        key = sentence.lower()
+        if key not in seen:
+            chosen.append(f"{sentence} [Source {source_number}]")
+            seen.add(key)
+        if len(chosen) == 2:
+            break
+    return " ".join(chosen)
+
+
 def answer_question(question):
     """Use retrieved evidence to write an answer and return its source cards."""
     sources = retrieve(question)
@@ -293,11 +335,10 @@ def answer_question(question):
             )
             response.raise_for_status()
         except requests.RequestException:
-            # Still return the retrieved calendar evidence if the free AI
-            # endpoint is temporarily unavailable or over its quota.
+            # Give a concise, cited answer from the retrieved text when the
+            # free AI endpoint is temporarily unavailable or over its quota.
             return {
-                "answer": "Gemini is temporarily rate-limited. Here is the matching calendar text: "
-                + " ".join(source["text"] for source in sources),
+                "answer": _local_calendar_answer(question, sources),
                 "sources": sources,
             }
         answer = response.json()["candidates"][0]["content"]["parts"][0]["text"]
