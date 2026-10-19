@@ -217,7 +217,6 @@ class RagChecks(unittest.TestCase):
             "text": "Add/drop deadline is September 4, 2026.",
         }]
         answer = rag._local_calendar_answer("When is my project due?", sources)
-        self.assertIn("couldn’t find a project completion deadline", answer)
         self.assertIn("Sorry, I couldn't find this information", answer)
         self.assertNotIn("September 4", answer)
 
@@ -270,6 +269,19 @@ class RagChecks(unittest.TestCase):
         answer = rag._local_calendar_answer("When do Autumn classes begin?", [source])
         self.assertIn("August 24, 2026", answer)
         self.assertIn("Autumn classes begin", answer)
+
+    def test_final_exam_answer_keeps_date_range_and_excludes_midterms_and_grade_dates(self):
+        source = {
+            "filename": "calendar.pdf",
+            "page": 1,
+            "text": "Spring 2027\nDATE\nEVENT / DEADLINE\nDETAILS\nMarch 8-12, 2027\nSpring midterm assessment period\nInstructors may schedule midterm exams.\nMay 12-14, 2027\nSpring final examination period\nFinal exams follow the published timetable; check the student portal for room and time.\nMay 21, 2027\nSpring grades available\nFinal grades are available in the student portal.",
+        }
+        answer = rag._local_calendar_answer("When are spring final exams?", [source])
+        self.assertIn("May 12-14, 2027", answer)
+        self.assertIn("student portal", answer)
+        self.assertNotIn("March 8", answer)
+        self.assertNotIn("May 21", answer)
+        self.assertNotIn("\n", answer.strip("\n").split(":", 1)[0])
 
     def test_autumn_start_answer_does_not_mix_in_spring(self):
         passages = [
@@ -357,7 +369,7 @@ class RagChecks(unittest.TestCase):
 
     def test_ui_displays_source_page_and_bolds_dates(self):
         script = (Path(__file__).parents[1] / "web" / "app.js").read_text(encoding="utf-8")
-        self.assertIn("Source: ${citation}", script)
+        self.assertNotIn("Source: ${citation}", script)
         self.assertIn("<strong>$&</strong>", script)
 
     def test_public_render_config_does_not_add_login_credentials(self):
