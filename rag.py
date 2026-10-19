@@ -27,7 +27,9 @@ AI_PROVIDER = os.getenv("AI_PROVIDER", "ollama").lower()
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 MONTH_PATTERN = r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
 CALENDAR_DATE_PATTERN = (
-    rf"\b(?:{MONTH_PATTERN})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:\s*[-–—]\s*\d{{1,2}}(?:st|nd|rd|th)?)?(?:,?\s+\d{{4}})?"
+    rf"\b(?:{MONTH_PATTERN})\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s*(?:20\d{{2}})?\s*[-–—]\s*(?:{MONTH_PATTERN})\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+20\d{{2}}"
+    rf"|\b(?:{MONTH_PATTERN})\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}\s*[-–—]\s*(?:{MONTH_PATTERN})\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+\d{{4}}"
+    rf"|\b(?:{MONTH_PATTERN})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:\s*[-–—]\s*\d{{1,2}}(?:st|nd|rd|th)?)?(?:,?\s+\d{{4}})?"
     rf"|\b\d{{1,2}}(?:\s*[-–—]\s*\d{{1,2}})?\s+(?:{MONTH_PATTERN})\s+\d{{4}}"
     r"|\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"
 )
@@ -254,7 +256,15 @@ def _asks_for_all_dates(question):
     words = set(re.findall(r"[a-z]+", question.lower()))
     asks_for_all = bool(words & {"all", "every", "each"})
     asks_for_dates = bool(words & {"date", "dates"})
-    return asks_for_all and asks_for_dates
+    # A request for all dates *of a category* (such as class-free days or
+    # withdrawal deadlines) must stay in the category-aware RAG path.
+    asks_for_category = bool(words & {
+        "class", "classes", "held", "holiday", "holidays", "deadline",
+        "deadlines", "withdrawal", "withdraw", "exam", "exams", "grade",
+        "grades", "registration", "installment", "installments", "fee",
+        "fees", "payment", "project", "assignment",
+    })
+    return asks_for_all and asks_for_dates and not asks_for_category
 
 
 def _event_after_date(text):
@@ -454,6 +464,8 @@ def _is_calendar_question(question):
         "test", "deadline", "due", "holiday", "break", "vacation", "registration", "register", "enroll", "fee",
         "tuition", "payment", "date", "schedule", "orientation", "campus", "commencement", "graduation", "add",
         "drop", "withdraw", "assignment", "project", "event", "autumn", "fall", "spring", "summer", "day", "until",
+        "winter", "closure", "closed", "recess", "office", "labor", "thanksgiving", "martin", "king",
+        "juneteenth", "independence", "presidents", "indigenous", "founders",
     }
     return bool(terms & calendar_terms or re.search(rf"{CALENDAR_DATE_PATTERN}", question, flags=re.IGNORECASE))
 
@@ -655,189 +667,430 @@ def _search_terms(text):
 def _calendar_table_rows(text, date_pattern):
     """Read date/title/detail rows from PDFs whose text is laid out in columns."""
     lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
-    date_line = re.compile(rf"^(?:{date_pattern})$", flags=re.IGNORECASE)
+    date_line = re.compile(rf"^(?:{date_pattern})[,]?$", flags=re.IGNORECASE)
     rows = []
     index = 0
     while index < len(lines):
-        date_text = lines[index].strip(" ,")
+        date_text = lines[index].strip()
+        consumed_date_lines = 0
+        # PDF table extraction often wraps a date range over several lines,
+        # e.g. "December 24," / "2026-January 1," / "2027". Rejoin only
+        # year continuations to avoid swallowing the following event title.
+        while index + consumed_date_lines + 1 < len(lines):
+            following_date_line = lines[index + consumed_date_lines + 1].strip()
+            if not re.fullmatch(r"20\d{2}(?:\s*[-–—]\s*.+)?", following_date_line):
+                break
+            if not re.search(rf"\b(?:{MONTH_PATTERN})\s+\d{{1,2}}", date_text, re.IGNORECASE):
+                break
+            date_text = date_text.rstrip(" ,") + " " + following_date_line
+            consumed_date_lines += 1
+            if re.search(r"\b20\d{2}\s*$", date_text) and not following_date_line.endswith(("-", "–", "—")):
+                break
         if not date_line.fullmatch(date_text):
             index += 1
             continue
+        date_text = date_text.rstrip(",")
         following = []
-        cursor = index + 1
-        while cursor < len(lines) and lines[cursor] and not date_line.fullmatch(lines[cursor].strip(" ,")):
+        cursor = index + consumed_date_lines + 1
+        while cursor < len(lines) and lines[cursor]:
+            current_line = lines[cursor].strip()
+            wrapped_date = (
+                cursor + 1 < len(lines)
+                and bool(re.match(rf"^(?:{MONTH_PATTERN})\s+\d{{1,2}}.*(?:,|[-–—])$", current_line, re.IGNORECASE))
+                and bool(re.match(r"^20\d{2}(?:\s*[-–—].*)?$", lines[cursor + 1].strip()))
+            )
+            if date_line.fullmatch(current_line.strip(" ,")) or wrapped_date:
+                break
             if lines[cursor].upper() not in {"DATE", "EVENT / DEADLINE", "DETAILS"}:
                 following.append(lines[cursor])
             cursor += 1
         if following:
             title = following[0]
-            # PDF extraction may wrap long event titles onto a second line.
-            while len(following) > 1 and (following[1][:1].islower() or following[1] in {"deadline", "period", "ceremony"}):
+            # PDF extraction may wrap a title or a final installment number.
+            while len(following) > 1 and (
+                following[1][:1].islower()
+                or following[1].isdigit()
+                or title.rstrip().endswith(("installment", "and", "for", "of", "upload"))
+            ):
                 title += " " + following.pop(1)
             detail = " ".join(following[1:])
-            rows.append((date_text, title, detail))
-        index = max(cursor, index + 1)
+        rows.append((date_text.replace(": ", ", "), title, detail))
+        index = max(cursor, index + consumed_date_lines + 1)
     return rows
 
 
-def _local_calendar_answer(question, sources):
-    """Give a brief answer from retrieved calendar text if Gemini is unavailable."""
-    original_terms = set(_search_terms(question))
-    asks_final = bool(original_terms & {"final", "finals"})
-    asks_midterm = bool(original_terms & {"midterm", "midterms"})
-    terms = set(original_terms)
-    expansions = {
-        "semester": {"term", "classes", "instruction"},
-        "begin": {"begins", "start", "starts", "first", "day"},
-        "start": {"starts", "begins", "first", "day"},
-        "end": {"ends", "last", "final", "finish", "conclude"},
-        "finish": {"end", "ends", "last", "final", "conclude"},
-        "exam": {"exams", "final", "midterm", "assessment"},
-        "holiday": {"holidays", "closure", "closed", "recess"},
-        "withdraw": {"withdrawal", "drop", "deadline"},
-        "deadline": {"due", "add", "drop", "withdraw", "withdrawal", "last", "day"},
-        "project": {"assignment", "deadline", "due", "submit", "submission", "complete"},
-        "assignment": {"project", "deadline", "due", "submit", "submission"},
-        "complete": {"project", "assignment", "deadline", "due"},
-    }
-    for term in list(terms):
-        terms.update(expansions.get(term, set()))
-
-    asks_about_project = bool(terms & {"project", "assignment"})
-    asks_about_deadline = bool(terms & {"deadline", "due", "submit", "submission", "project", "assignment"})
-    asks_withdrawal = bool(original_terms & {"withdraw", "withdrawal"})
-    asks_add_drop = bool(original_terms & {"add", "drop"})
-    asks_about_start = bool(terms & {"begin", "start", "first"})
-    asks_about_end = bool(terms & {"end", "finish", "conclude"})
-    asks_about_academic_period = bool(terms & {"semester", "term", "class", "instruction", "autumn", "fall", "spring", "summer", "session"})
-    requested_season = next((season for season in ("autumn", "fall", "spring", "summer") if season in terms), None)
-    date_pattern = (
-        r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:st|nd|rd|th)?(?:\s*[-–—]\s*\d{1,2}(?:st|nd|rd|th)?)?(?:,?\s+\d{4})?"
-        r"|\b\d{1,2}(?:\s*[-–—]\s*\d{1,2})?\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{4}"
-        r"|\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"
+def _parse_calendar_date_range(date_text, inferred_year=None):
+    """Parse a displayed date or date range into inclusive start/end dates."""
+    value = re.sub(r"\s+", " ", date_text.strip()).replace(": ", ", ")
+    cross_month = re.fullmatch(
+        rf"({MONTH_PATTERN})\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s*(?:(\d{{4}})\s*)?[-–—]\s*({MONTH_PATTERN})\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s*(\d{{4}})",
+        value,
+        flags=re.IGNORECASE,
     )
-    candidates = []
-    for source_number, source in enumerate(sources, start=1):
-        source_text = source["text"]
-        table_rows = _calendar_table_rows(source_text, date_pattern)
-        page_seasons = set(_search_terms(" ".join(re.findall(r"\b(?:autumn|fall|spring|summer)\s+\d{4}\b", source_text, flags=re.IGNORECASE))))
-        active_season = next(iter(page_seasons)) if len(page_seasons) == 1 else ""
-        if table_rows:
-            event_rows = table_rows
-        else:
-            # Fallback for prose PDFs whose date and event are in the same sentence.
-            event_rows = []
-            prose = re.split(r"(?<=[.!?])\s+|\n+", source_text) + _date_event_windows(source_text, date_pattern)
-            for sentence in prose:
-                found = re.search(date_pattern, sentence, flags=re.IGNORECASE)
-                if found:
-                    event_rows.append((found.group(0), sentence, ""))
-        for date_text, title, detail in event_rows:
-            event_text = f"{title} {detail}".strip()
-            title_terms = set(_search_terms(title))
-            explicit_title_season = next((season for season in ("autumn", "fall", "spring", "summer") if season in title_terms), None)
-            detail_season = next((season for season in ("autumn", "fall", "spring", "summer") if re.search(rf"\b{season}\s+(?:course|semester|session|classes|tuition|term)\b", detail, flags=re.IGNORECASE)), None)
-            if explicit_title_season or detail_season:
-                active_season = explicit_title_season or detail_season
-            sentence_terms = set(_search_terms(event_text))
-            if active_season:
-                sentence_terms.add(active_season)
-            overlap = len(terms & sentence_terms)
-            if overlap and len(event_text) >= 5:
-                if requested_season:
-                    acceptable_seasons = {requested_season}
-                    if requested_season == "fall":
-                        acceptable_seasons.add("autumn")
-                    if requested_season == "autumn":
-                        acceptable_seasons.add("fall")
-                    if not (sentence_terms & acceptable_seasons):
-                        continue
-                if asks_final and "midterm" in sentence_terms:
-                    continue
-                if asks_midterm and "final" in sentence_terms:
-                    continue
-                if asks_final and ("final" not in title_terms or not title_terms & {"exam", "examination"}):
-                    continue
-                if asks_midterm and "midterm" not in title_terms:
-                    continue
-                if asks_about_academic_period and asks_about_start:
-                    if not (sentence_terms & {"begin", "begins", "start", "starts", "first"}):
-                        continue
-                    if sentence_terms & {"end", "ends", "conclude", "withdraw", "withdrawal"}:
-                        continue
-                if asks_about_academic_period and asks_about_end:
-                    has_end_event = bool(sentence_terms & {"end", "ends", "last", "final", "conclude"})
-                    has_academic_event = bool(sentence_terms & {"class", "instruction", "session"})
-                    if not (has_end_event and has_academic_event):
-                        continue
-                if asks_about_project and not (sentence_terms & {"project", "assignment", "submission", "submit"}):
-                    continue
-                if asks_withdrawal and not sentence_terms & {"withdraw", "withdrawal"}:
-                    continue
-                if asks_add_drop and not title_terms & {"add", "drop"}:
-                    continue
-                if asks_about_deadline and not (sentence_terms & {"deadline", "due", "withdraw", "withdrawal", "add", "drop", "project", "assignment", "submit", "submission"}):
-                    continue
-                candidates.append((overlap / max(len(sentence_terms) ** 0.35, 1), date_text, title, detail, source_number))
+    same_month = re.fullmatch(
+        rf"({MONTH_PATTERN})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:\s*[-–—]\s*(\d{{1,2}})(?:st|nd|rd|th)?)?,?\s*(\d{{4}})?",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if cross_month:
+        month1, day1, year1, month2, day2, year2 = cross_month.groups()
+        try:
+            start = date(int(year1 or year2), datetime.strptime(month1[:3], "%b").month, int(day1))
+            end = date(int(year2), datetime.strptime(month2[:3], "%b").month, int(day2))
+        except ValueError:
+            return None, None
+        return (start, end) if end >= start else (None, None)
+    if same_month:
+        month_name, day1, day2, year = same_month.groups()
+        year = int(year or inferred_year or 0)
+        if not year:
+            return None, None
+        try:
+            month = datetime.strptime(month_name[:3], "%b").month
+            start = date(year, month, int(day1))
+            end = date(year, month, int(day2 or day1))
+        except ValueError:
+            return None, None
+        return (start, end) if end >= start else (None, None)
+    numeric = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})", value)
+    if numeric:
+        a, b, year = map(int, numeric.groups())
+        year += 2000 if year < 100 else 0
+        # Calendar PDFs commonly use US month/day; allow a clear day/month
+        # value when the first number cannot be a month.
+        month, day = (a, b) if a <= 12 else (b, a)
+        try:
+            parsed = date(year, month, day)
+            return parsed, parsed
+        except ValueError:
+            return None, None
+    return None, None
 
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    if not candidates:
+
+def _display_date_range(date_text, start, end):
+    """Normalize wrapped cross-month dates while preserving numeric formats."""
+    if not start or not end:
+        return date_text
+    if not re.search(rf"(?:{MONTH_PATTERN})\s+\d", date_text, flags=re.IGNORECASE):
+        return date_text
+    day_format = "%-d" if os.name != "nt" else "%#d"
+    start_day = start.strftime(f"%B {day_format}")
+    end_day = end.strftime(f"%B {day_format}")
+    if start == end:
+        return f"{start_day}, {start.year}"
+    if start.month == end.month:
+        return f"{start.strftime('%B')} {start.strftime(day_format)}-{end.strftime(day_format)}, {end.year}"
+    if start.year == end.year:
+        return f"{start_day}-{end_day}, {end.year}"
+    return f"{start_day}, {start.year}-{end_day}, {end.year}"
+
+
+def _calendar_events(sources):
+    """Extract normalized dated events from all available calendar pages."""
+    events = []
+    seen = set()
+    for source in sources:
+        text = source.get("text", "")
+        years = [int(year) for year in re.findall(r"\b20\d{2}\b", text)]
+        inferred_year = years[0] if years else None
+        rows = _calendar_table_rows(text, CALENDAR_DATE_PATTERN)
+        if not rows:
+            # Sentence-style calendars put the date inside the event sentence.
+            for match in re.finditer(CALENDAR_DATE_PATTERN, text, flags=re.IGNORECASE):
+                left = max(text.rfind(mark, 0, match.start()) for mark in (".", "!", "?", "\n")) + 1
+                stops = [pos for mark in (".", "!", "?", "\n") if (pos := text.find(mark, match.end())) >= 0]
+                right = min(stops) if stops else len(text)
+                sentence = text[left:right].strip(" \t:;,-")
+                remainder = re.sub(re.escape(match.group(0)), "", sentence, flags=re.IGNORECASE)
+                remainder = re.sub(r"\s+", " ", remainder).strip(" .,:;-|")
+                if remainder:
+                    # Remove a section heading that PDF text extraction may
+                    # place immediately before a sentence-style calendar row.
+                    remainder = re.sub(
+                        r"^(?:(?:AUTUMN|FALL|SPRING|SUMMER)(?:\s+SEMESTER)?\s+20\d{2}\s*)+",
+                        "",
+                        remainder,
+                        flags=re.IGNORECASE,
+                    ).strip()
+                    remainder = re.sub(r"^(?:DATE\s+)?(?:ACADEMIC\s+)?EVENT\s+", "", remainder, flags=re.IGNORECASE).strip()
+                    rows.append((match.group(0), remainder, ""))
+        section_season_match = re.search(r"\b(autumn|fall|spring|summer)\s+20\d{2}\b", text, flags=re.IGNORECASE)
+        active_season = section_season_match.group(1).lower() if section_season_match else ""
+        for date_text, title, detail in rows:
+            title = re.sub(r"\s+", " ", title).strip(" .,:;-|")
+            detail = re.sub(r"\s+", " ", detail).strip()
+            title_terms = set(_search_terms(title))
+            explicit_season = next((name for name in ("autumn", "fall", "spring", "summer") if name in title_terms), None)
+            detail_season = next((name for name in ("autumn", "fall", "spring", "summer") if re.search(rf"\b{name}\s+(?:course|semester|session|classes|tuition|term)\b", detail, flags=re.IGNORECASE)), None)
+            if explicit_season or detail_season:
+                active_season = explicit_season or detail_season
+            if active_season and "first" in title_terms and "class" in title_terms and "instruction" in set(_search_terms(title + " " + detail)):
+                title = f"{active_season.title()} classes begin"
+            start, end = _parse_calendar_date_range(date_text, inferred_year)
+            if not start:
+                continue
+            date_text = _display_date_range(date_text, start, end)
+            key = (source.get("filename", ""), start, end, title.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            events.append({
+                "filename": source.get("filename", ""),
+                "page": source.get("page"),
+                "date_text": date_text,
+                "start": start,
+                "end": end,
+                "title": title,
+                "detail": detail,
+                "season": active_season,
+            })
+    events.sort(key=lambda event: (event["start"], event["filename"].casefold(), event["page"] or 0))
+    return events
+
+
+def _local_calendar_answer(question, sources):
+    """Answer date and event questions from normalized rows across the supplied pages."""
+    original = set(_search_terms(question))
+    events = _calendar_events(sources)
+    if not events:
         return "Sorry, I couldn't find this information in the available academic calendar. Please check the official university website or contact the university administration."
 
-    if asks_about_academic_period and (asks_about_start or asks_about_end):
-        selected = []
-        seen_terms = set()
-        for _, date_text, title, _, _ in candidates:
-            season = next((label for label in ("autumn", "fall", "spring", "summer") if label in _search_terms(title)), requested_season or "")
-            if (season, date_text.lower()) in seen_terms:
+    # Select semester terms only when they function as a term name; "fall in
+    # March" is a month question, while "Fall registration" names a semester.
+    seasons = set(original & {"autumn", "spring", "summer"})
+    if "fall" in original and original & {"semester", "term", "registration", "register", "classes", "course"}:
+        seasons.add("fall" if original & {"registration", "register"} else "autumn")
+    session_labels = {label for label in ("a", "b") if re.search(rf"\bsession\s+{label}\b", question, flags=re.IGNORECASE)}
+    month_names = {name.lower(): number for number, name in enumerate(("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"), 1)}
+    month_match = re.search(r"\b(" + "|".join(month_names) + r")\s+(20\d{2})\b", question, flags=re.IGNORECASE)
+    month_in_date_question = re.search(
+        r"\b(?:in|during|occur(?:s)?\s+in|fall\s+in)\s+(" + "|".join(month_names) + r")(?:\s+(20\d{2}))?\b|\b(" + "|".join(month_names) + r")\s+(20\d{2})\b",
+        question,
+        flags=re.IGNORECASE,
+    )
+    target_month = None
+    target_year = None
+    if month_in_date_question:
+        month_name = month_in_date_question.group(1) or month_in_date_question.group(3)
+        year_value = month_in_date_question.group(2) or month_in_date_question.group(4)
+        target_month = month_names[month_name.lower()]
+        target_year = int(year_value) if year_value else None
+    elif named_event_month := re.search(
+            r"\b(" + "|".join(month_names) + r")\s+(?:commencement|ceremony)\b",
+            question,
+            flags=re.IGNORECASE,
+        ):
+        target_month = month_names[named_event_month.group(1).lower()]
+
+    asks_begin = bool(original & {"begin", "begins", "start", "starts", "first", "open", "opens"})
+    asks_end = bool(original & {"end", "ends", "finish", "finishes", "conclude", "last"})
+    asks_class_period = bool(original & {"class", "classes", "semester", "term", "instruction", "session"})
+    asks_final = "final" in original and bool(original & {"exam", "examination", "assessment"})
+    asks_midterm = "midterm" in original
+    asks_exam_general = bool(original & {"exam", "examination", "assessment", "midterm"})
+    asks_withdrawal = bool(original & {"withdraw", "withdrawal"})
+    asks_add_drop = bool(original & {"add", "drop"})
+    asks_registration = bool(original & {"registration", "register", "enrollment", "enroll"})
+    asks_advising = "advising" in original or "adviser" in original or "advisor" in original
+    asks_tuition = bool(original & {"tuition", "fee", "payment", "installment", "billing"})
+    asks_installments = "installment" in original or "installments" in original
+    asks_grades = "grade" in original or "grades" in original
+    asks_grade_view = bool(original & {"view", "available", "release", "released"})
+    asks_grades_due = asks_grades and bool(original & {"due", "submit", "submitted"}) and not asks_grade_view
+    asks_orientation = "orientation" in original
+    asks_project = bool(original & {"project", "proposal", "capstone", "assignment"})
+    asks_graduation = bool(original & {"graduation", "graduate", "graduates", "commencement"})
+    holiday_names = {"labor", "thanksgiving", "winter", "martin", "king", "juneteenth", "independence", "presidents", "indigenous", "founders"}
+    asks_holiday = bool(original & ({"holiday", "holidays", "break", "recess", "vacation", "closed", "closure"} | holiday_names))
+    asks_no_classes = bool(original & {"every", "all", "each"}) and bool(original & {"class", "classes"}) and bool(original & {"date", "dates", "held"})
+    asks_withdraw_advice = asks_withdrawal and bool(original & {"consider", "before", "impact", "affect"})
+    asks_deadline = bool(original & {"deadline", "due", "last"}) or asks_withdrawal or asks_add_drop
+    today = _today()
+    upcoming = bool(original & {"upcoming", "coming"}) or "next month" in question.lower()
+    asks_multi = bool(original & {"all", "every", "each", "both", "dates", "installments"}) or bool(target_month) or len(session_labels) > 1 or upcoming
+    asks_both_terms = ("autumn" in seasons and "spring" in seasons) or ("fall" in original and "spring" in original)
+    asks_both_start_end = asks_begin and asks_end
+    needs_monthly_deadlines = bool(target_month and asks_deadline)
+
+    filtered = []
+    for event in events:
+        title = event["title"]
+        detail = event["detail"]
+        text = f"{title} {detail}".lower()
+        words = set(_search_terms(text))
+        event_season = event["season"]
+        if seasons and event_season:
+            allowed_seasons = set(seasons)
+            if "autumn" in seasons and "fall" not in seasons:
+                allowed_seasons.add("fall")
+            if event_season not in allowed_seasons:
                 continue
-            seen_terms.add((season, date_text.lower()))
-            date = date_text
-            if asks_about_start:
-                event = f"{season.title()} classes begin" if season in {"autumn", "fall", "spring"} else "Summer session begins" if season == "summer" else "Classes begin"
+        elif seasons and not (set(_search_terms(text)) & seasons):
+            continue
+        if session_labels:
+            if not any(re.search(rf"\bsession\s+{label}\b", text, flags=re.IGNORECASE) for label in session_labels):
+                continue
+        if target_month and (event["start"].month != target_month and event["end"].month != target_month):
+            continue
+        if target_year and event["start"].year != target_year and event["end"].year != target_year:
+            continue
+        if upcoming:
+            if "next month" in question.lower():
+                end_window = today + timedelta(days=30)
             else:
-                event = f"{season.title()} classes end" if season in {"autumn", "fall", "spring"} else "Summer session ends" if season == "summer" else "Classes end"
-            selected.append(f"{event} on {date}.")
-            if requested_season or len(selected) == 2:
-                break
-        season_order = {"autumn": 0, "fall": 0, "spring": 1, "summer": 2}
-        selected.sort(key=lambda answer: next(
-            (order for season, order in season_order.items() if answer.lower().startswith(season)),
-            3,
-        ))
-        return " ".join(selected) if selected else "Sorry, I couldn't find this information in the available academic calendar. Please check the official university website or contact the university administration."
+                end_window = today + timedelta(days=30)
+            if event["start"] < today or event["start"] > end_window:
+                continue
+        title_words = set(_search_terms(title))
+        if asks_begin or asks_end:
+            if asks_class_period:
+                has_begin = bool(words & {"begin", "begins", "start", "starts", "first", "open", "opens"})
+                has_end = bool(words & {"end", "ends", "finish", "last", "final"})
+                title_has_begin = bool(title_words & {"begin", "begins", "start", "starts", "first", "open", "opens"})
+                title_has_end = bool(title_words & {"end", "ends", "finish", "last", "final"})
+                if asks_begin and asks_end:
+                    if not (title_has_begin or title_has_end):
+                        continue
+                elif asks_begin and not has_begin:
+                    continue
+                elif asks_end and not has_end:
+                    continue
+                elif asks_begin and not title_has_begin:
+                    continue
+                elif asks_end and not title_has_end:
+                    continue
+                if not title_words & {"class", "classes", "instruction", "semester", "term", "session"}:
+                    continue
+                if asks_begin and not words & {"class", "classes", "instruction", "semester", "term", "session"}:
+                    continue
+                if asks_end and not words & {"class", "classes", "instruction", "session", "semester", "term"}:
+                    continue
+        if asks_final:
+            if "final" not in title_words or not title_words & {"exam", "examination", "assessment"} or "midterm" in title_words:
+                continue
+        elif asks_midterm:
+            if "midterm" not in title_words or "final" in title_words:
+                continue
+            if original & {"assessment", "exam", "examination"} and not title_words & {"assessment", "exam", "examination"}:
+                continue
+        elif asks_exam_general and not words & {"exam", "examination", "assessment", "midterm"}:
+            continue
+        if asks_withdrawal and not words & {"withdraw", "withdrawal"}:
+            continue
+        if asks_add_drop and not ("add" in words or "drop" in words):
+            continue
+        if asks_registration and not title_words & {"registration", "register", "enrollment", "enroll"}:
+            continue
+        if asks_advising and not title_words & {"advising", "adviser", "advisor"}:
+            continue
+        if asks_begin and asks_advising and not title_words & {"open", "opens"}:
+            continue
+        if asks_begin and asks_registration and not title_words & {"open", "opens"}:
+            continue
+        if asks_advising and "period" in original and "period" not in title_words:
+            continue
+        if asks_tuition:
+            if asks_installments:
+                if "installment" not in words or not words & {"payment", "tuition", "plan"}:
+                    continue
+            elif not words & {"tuition", "fee", "payment"}:
+                continue
+        if asks_grades_due and not ("grade" in title_words and words & {"due", "submit", "submitted"}):
+            continue
+        if asks_grades and asks_grade_view and not ("grade" in words and words & {"available", "view", "release", "released"}):
+            continue
+        if asks_orientation and "orientation" not in words:
+            continue
+        if asks_project and not words & {"project", "proposal", "capstone", "assignment"}:
+            continue
+        if "proposal" in original and "proposal" not in title_words:
+            continue
+        if "research" in original and asks_project and "research" not in words:
+            continue
+        if "capstone" in original and "capstone" not in words:
+            continue
+        if "capstone" in original and "project" in original and "project" not in title_words:
+            continue
+        if asks_graduation and not title_words & {"graduation", "graduate", "commencement", "application"}:
+            continue
+        if asks_holiday:
+            if not words & {"holiday", "recess", "break", "vacation", "closed", "closure", "day", "study"}:
+                continue
+            title_words = set(_search_terms(title))
+            named_holiday_terms = original & holiday_names
+            if named_holiday_terms and not named_holiday_terms <= title_words:
+                continue
+            if "recess" in original and "recess" not in title_words:
+                continue
+            if "break" in original and not title_words & {"break", "recess"}:
+                continue
+            if "closed" in original and "closed" not in words:
+                continue
+        if asks_no_classes and not (words & {"closed", "closure", "recess", "break", "holiday", "study", "classes"} and words & {"no", "closed", "recess", "break", "holiday", "study"}):
+            continue
+        if asks_withdraw_advice and not words & {"financial", "aid", "transcript", "withdraw"}:
+            continue
+        if needs_monthly_deadlines and not words & {"deadline", "due", "withdraw", "withdrawal", "add", "drop", "registration", "register", "project", "assignment", "proposal", "capstone", "installment"}:
+            continue
+        query_words = original - {"when", "what", "which", "does", "do", "is", "are", "the", "a", "an", "in", "on", "for", "to", "from", "and", "with", "should", "can", "i", "me", "my", "this", "that", "of", "important", "date", "dates", "semester", "term", "academic", "calendar", "classes", "class"}
+        score = len(query_words & words)
+        if score or seasons or asks_begin or asks_end or asks_exam_general or asks_grades or asks_tuition or asks_advising or asks_registration or asks_holiday or asks_orientation or asks_project or asks_withdrawal or asks_add_drop or asks_no_classes or target_month or upcoming:
+            filtered.append((score, event))
 
-    chosen = []
-    seen = set()
-    for _, date_text, title, detail, _ in candidates:
-        key = (date_text.lower(), title.lower())
-        if key not in seen:
-            chosen.append((date_text, title, detail))
-            seen.add(key)
-        answer_limit = 1 if asks_about_deadline else 2
-        if len(chosen) == answer_limit:
-            break
+    filtered.sort(key=lambda pair: ((-pair[0], pair[1]["start"]) if not asks_multi else (pair[1]["start"], -pair[0])))
+    matches = [event for _, event in filtered]
 
-    if asks_about_project:
-        date_text, title, detail = chosen[0]
-        return f"{date_text}: {title}. {detail[:180]} Aim to submit early and confirm the requirements with your instructor.".replace("..", ".")
-    if asks_about_deadline:
-        if asks_about_project:
-            advice = "Aim to submit early and confirm any project-specific instructions with your instructor."
-        elif "withdraw" in terms:
-            advice = "Submit the request before the deadline and confirm that it was recorded."
+    # A comparative timing question must calculate from two verified events.
+    if bool(original & {"before", "after"}) and bool(original & {"day", "days", "many"}) and asks_tuition:
+        start_event = next((event for event in events if "spring" in seasons and event["season"] == "spring" and set(_search_terms(event["title"] + " " + event["detail"])) & {"begin", "begins", "first"} and set(_search_terms(event["title"] + " " + event["detail"])) & {"class", "classes", "instruction"}), None)
+        due_event = next((event for event in events if "spring" in seasons and event["season"] == "spring" and set(_search_terms(event["title"])) & {"tuition", "fee"} and "due" in set(_search_terms(event["title"]))), None)
+        if due_event and start_event:
+            gap = (start_event["start"] - due_event["start"]).days
+            if gap >= 0:
+                return f"Spring tuition is due {due_event['date_text']}, {gap} days before classes begin on {start_event['date_text']}."
+
+    if not filtered:
+        return "Sorry, I couldn't find this information in the available academic calendar. Please check the official university website or contact the university administration."
+
+    # Named date questions should return only the matching event; bulk/list
+    # questions return all matching rows (e.g. every installment or exam).
+    if asks_both_start_end or asks_both_terms or asks_multi or asks_exam_general and not asks_final and not asks_midterm or asks_grade_view and len(matches) > 1 or asks_withdraw_advice:
+        limit = 12
+    elif asks_deadline and not asks_installments:
+        limit = 1
+    elif asks_begin and asks_end:
+        limit = 6
+    else:
+        limit = 2
+
+    if "last" in original and asks_registration and matches:
+        latest = max(matches, key=lambda event: event["end"])
+        day = latest["end"].strftime("%B %-d, %Y") if os.name != "nt" else latest["end"].strftime("%B %#d, %Y")
+        return f"The last day for fall registration is {day}. The open-enrollment period is {latest['date_text']}."
+
+    matches = matches[:limit]
+    if asks_withdraw_advice:
+        date_lines = "; ".join(f"{event['date_text']} ({event['season'] or 'term'} course)" for event in matches)
+        return f"Check how withdrawing could affect your transcript and financial aid, and confirm the change with an adviser. The calendar lists these withdrawal deadlines: {date_lines}."
+
+    lines = []
+    for event in matches:
+        title = event["title"].rstrip(" .")
+        detail = event["detail"]
+        if asks_exam_general and (asks_final or asks_midterm) and detail:
+            detail = re.split(r"(?<=[.!?])\s+", detail)[0]
+        elif detail:
+            detail = re.split(r"(?<=[.!?])\s+", detail)[0]
+        if detail and not detail.endswith((".", "!", "?")):
+            detail += "."
+        if asks_withdrawal and not asks_multi:
+            advice = " Submit the request before the cutoff and confirm it was recorded."
+        elif asks_project:
+            advice = " Please submit early and follow your instructor's submission instructions."
         else:
-            advice = "Check the course instructions for any course-specific cutoff, and plan ahead."
-        date_text, title, _ = chosen[0]
-        return f"{date_text}: {title}. {advice}"
-    formatted = []
-    for date_text, title, detail in chosen:
-        description = re.split(r"(?<=[.!?])\s+", detail.strip())[0] if detail else ""
-        description = description.strip()
-        if description and not description.endswith((".", "!", "?")):
-            description += "."
-        formatted.append(f"- {date_text}: {title}." + (f" {description}" if description else ""))
-    return "\n".join(formatted)
+            advice = ""
+        lines.append(f"- {event['date_text']}: {title}." + (f" {detail}" if detail else "") + advice)
+    return "\n".join(lines)
 
 
 def _date_event_windows(text, date_pattern):
@@ -881,7 +1134,11 @@ def answer_question(question, history=None):
     # Deadline answers are date lookups, so answer them directly from the
     # retrieved calendar entries instead of risking a vague generated reply.
     question_terms = set(_search_terms(effective_question))
-    if question_terms & {"day", "days", "until", "remain", "remaining", "left"}:
+    comparative_days = bool(question_terms & {"before", "after"})
+    asks_countdown = bool(question_terms & {"until", "remain", "remaining", "left"}) or (
+        bool(question_terms & {"day", "days", "many"}) and not comparative_days
+    )
+    if asks_countdown:
         full_calendar_sources = [
             {"filename": filename, "page": page_number, "text": page_text}
             for _, filename, page_number, page_text in _all_calendar_pages()
@@ -891,10 +1148,16 @@ def answer_question(question, history=None):
             countdown = "Sorry, I couldn't find this information in the available academic calendar. Please check the official university website or contact the university administration."
         return {"answer": countdown, "sources": full_calendar_sources}
 
-    # Prefer exact event/date extraction whenever the retrieved calendar gives
-    # a usable answer. This prevents a generative model from blending nearby
-    # rows such as midterms, final exams, and grade release dates.
-    local_answer = _local_calendar_answer(effective_question, sources)
+    # Calendar-wide local extraction matters because top-k retrieval can omit
+    # the relevant row (or include only part of a date range). Use every
+    # indexed page for event lookup, while retaining retrieved passages as the
+    # UI's source cards.
+    full_calendar_sources = [
+        {"filename": filename, "page": page_number, "text": page_text}
+        for _, filename, page_number, page_text in _all_calendar_pages()
+    ]
+    calendar_evidence = full_calendar_sources or sources
+    local_answer = _local_calendar_answer(effective_question, calendar_evidence)
     if not local_answer.startswith("Sorry, I couldn't find this information"):
         return {"answer": local_answer, "sources": sources}
     asks_for_academic_date = bool(question_terms & {"begin", "start", "first", "end", "finish", "conclude"}) and bool(
@@ -903,7 +1166,7 @@ def answer_question(question, history=None):
     if AI_PROVIDER == "gemini" and (question_terms & {
         "deadline", "due", "project", "assignment", "submit", "submission"
     } or asks_for_academic_date):
-        return {"answer": _local_calendar_answer(effective_question, sources), "sources": sources}
+        return {"answer": _local_calendar_answer(effective_question, calendar_evidence), "sources": sources}
 
     evidence = "\n\n".join(
         f"[Source {number}: {source['filename']}, page {source['page']}] {source['text']}"
@@ -929,7 +1192,7 @@ def answer_question(question, history=None):
     if AI_PROVIDER == "gemini":
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
-            return {"answer": _local_calendar_answer(effective_question, sources), "sources": sources}
+            return {"answer": _local_calendar_answer(effective_question, calendar_evidence), "sources": sources}
         model = os.getenv("GEMINI_CHAT_MODEL", "gemini-2.5-flash-lite")
         try:
             response = requests.post(
@@ -947,7 +1210,7 @@ def answer_question(question, history=None):
             # Give a concise, cited answer from the retrieved text when the
             # free AI endpoint is temporarily unavailable or over its quota.
             return {
-                "answer": _local_calendar_answer(effective_question, sources),
+                "answer": _local_calendar_answer(effective_question, calendar_evidence),
                 "sources": sources,
             }
         try:
@@ -956,7 +1219,7 @@ def answer_question(question, history=None):
         except (KeyError, IndexError, TypeError, ValueError):
             answer = ""
         if not answer:
-            answer = _local_calendar_answer(effective_question, sources)
+            answer = _local_calendar_answer(effective_question, calendar_evidence)
         else:
             answer = re.sub(r"\s*\[Source\s+\d+\]", "", answer, flags=re.IGNORECASE).strip()
             sentences = re.split(r"(?<=[.!?])\s+", answer)
@@ -979,7 +1242,7 @@ def answer_question(question, history=None):
             response.raise_for_status()
             answer = response.json().get("message", {}).get("content", "").strip()
         except requests.RequestException:
-            answer = _local_calendar_answer(effective_question, sources)
+            answer = _local_calendar_answer(effective_question, calendar_evidence)
         if not answer:
             answer = _local_calendar_answer(effective_question, sources)
     return {"answer": answer, "sources": sources}
