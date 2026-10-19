@@ -6,6 +6,7 @@ import os
 import re
 import sqlite3
 import uuid
+from datetime import datetime
 from collections import Counter
 from io import BytesIO
 from pathlib import Path
@@ -24,6 +25,12 @@ MAX_EXTRACTED_CHARACTERS = 4_000_000
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 AI_PROVIDER = os.getenv("AI_PROVIDER", "ollama").lower()
 GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+MONTH_PATTERN = r"Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?"
+CALENDAR_DATE_PATTERN = (
+    rf"\b(?:{MONTH_PATTERN})\s+\d{{1,2}}(?:st|nd|rd|th)?(?:\s*[-–—]\s*\d{{1,2}}(?:st|nd|rd|th)?)?(?:,?\s+\d{{4}})?"
+    rf"|\b\d{{1,2}}(?:\s*[-–—]\s*\d{{1,2}})?\s+(?:{MONTH_PATTERN})\s+\d{{4}}"
+    r"|\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"
+)
 
 
 def ai_status():
@@ -76,7 +83,11 @@ def connect_database():
 
 def split_into_chunks(text):
     """Split text into overlapping passages so nearby context is retained."""
-    clean_text = re.sub(r"\s+", " ", text).strip()
+    # Keep line breaks: PDF calendars often use one row per date, and those
+    # boundaries help us pair each date with the correct event name.
+    clean_text = re.sub(r"\r\n?", "\n", text)
+    clean_text = re.sub(r"[ \t]+", " ", clean_text)
+    clean_text = re.sub(r"\n{3,}", "\n\n", clean_text).strip()
     chunks = []
     start = 0
 
@@ -201,6 +212,223 @@ def get_documents():
     ).fetchall()
     connection.close()
     return [dict(row) for row in rows]
+
+
+def _all_calendar_pages():
+    """Read every indexed page, not only the top search results."""
+    connection = connect_database()
+    rows = connection.execute(
+        "SELECT document_id, filename, page, text FROM passages ORDER BY document_id, page, rowid"
+    ).fetchall()
+    connection.close()
+
+    pages = []
+    current_key = None
+    page_chunks = []
+    for row in rows:
+        key = (row["document_id"], row["filename"], row["page"])
+        if current_key is not None and key != current_key:
+            pages.append((*current_key, _join_overlapping_chunks(page_chunks)))
+            page_chunks = []
+        current_key = key
+        page_chunks.append(row["text"])
+    if current_key is not None:
+        pages.append((*current_key, _join_overlapping_chunks(page_chunks)))
+    return pages
+
+
+def _join_overlapping_chunks(chunks):
+    """Reassemble chunks from one page while removing their shared overlap."""
+    if not chunks:
+        return ""
+    combined = chunks[0]
+    for chunk in chunks[1:]:
+        overlap = min(300, len(combined), len(chunk))
+        while overlap and combined[-overlap:] != chunk[:overlap]:
+            overlap -= 1
+        combined += chunk[overlap:] if overlap else "\n" + chunk
+    return combined
+
+
+def _asks_for_all_dates(question):
+    words = set(re.findall(r"[a-z]+", question.lower()))
+    asks_for_all = bool(words & {"all", "every", "each"})
+    asks_for_dates = bool(words & {"date", "dates"})
+    return asks_for_all and asks_for_dates
+
+
+def _event_after_date(text):
+    """Get a short event title following a date-only table row."""
+    lines = [line.strip(" \t:.-") for line in text.splitlines() if line.strip()]
+    headings = {"date", "academic event", "details", "page 1", "page 2"}
+    lines = [line for line in lines if line.lower() not in headings]
+    if not lines:
+        return ""
+    title = lines[0]
+    # PDF extraction sometimes wraps one title onto a lowercase continuation,
+    # for example “Course withdrawal” / “deadline”.
+    for line in lines[1:3]:
+        if line[:1].islower():
+            title += " " + line
+        else:
+            break
+    title = re.sub(r"\s+", " ", title).strip()
+    title = re.sub(r"\bDATE\s+ACADEMIC EVENT\s+DETAILS\b", "", title, flags=re.IGNORECASE).strip()
+    return title[:100]
+
+
+def _date_components(date_text, inferred_year=None):
+    """Return (year, month, day) values represented by a month-name date/range."""
+    match = re.fullmatch(
+        r"([A-Za-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?"
+        r"(?:\s*[-–—]\s*(\d{1,2})(?:st|nd|rd|th)?)?"
+        r"(?:,?\s+(\d{4}))?",
+        date_text.strip(),
+    )
+    if not match:
+        return set()
+    month_name, first_day, last_day, year = match.groups()
+    try:
+        month = datetime.strptime(month_name[:3], "%b").month
+    except ValueError:
+        return set()
+    year = int(year or inferred_year or 0)
+    if not year:
+        return set()
+    first_day = int(first_day)
+    last_day = int(last_day or first_day)
+    return {(year, month, day) for day in range(first_day, last_day + 1)}
+
+
+def list_all_calendar_dates():
+    """Return one clean date/event line for every distinct calendar date."""
+    pages = _all_calendar_pages()
+    if not pages:
+        return "Upload an academic calendar first, and I can list its dates."
+
+    entries = []
+    seen = set()
+    entry_by_key = {}
+    for document_id, filename, page_number, text in pages:
+        matches = list(re.finditer(CALENDAR_DATE_PATTERN, text, flags=re.IGNORECASE))
+        dated_matches = [
+            match for match in matches
+            if re.search(r"\b\d{4}\b", match.group(0))
+        ]
+        for index, match in enumerate(matches):
+            date = re.sub(r"\s+", " ", match.group(0)).strip(" ,")
+            if not re.search(r"\b\d{4}\b", date) and dated_matches:
+                nearest = min(dated_matches, key=lambda other: abs(other.start() - match.start()))
+                year = re.search(r"\b\d{4}\b", nearest.group(0)).group(0)
+                date = f"{date}, {year}"
+            date_points = _date_components(date)
+            document_key = filename.casefold()
+            key = (document_key, frozenset(date_points) if date_points else re.sub(r"\s+", "", date.lower()).replace("—", "-").replace("–", "-"))
+            if date_points and any(
+                existing_document == document_key and isinstance(existing_value, frozenset) and date_points < existing_value
+                for existing_document, existing_value in seen
+            ):
+                continue
+
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            line_end = text.find("\n", match.end())
+            if line_end == -1:
+                line_end = len(text)
+            before_on_line = text[line_start:match.start()].strip()
+            after_on_line = text[match.end():line_end].strip()
+            standalone_date = not before_on_line and not after_on_line
+
+            if standalone_date:
+                next_date_start = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+                event = _event_after_date(text[match.end():next_date_start])
+            else:
+                left = max(text.rfind(mark, 0, match.start()) for mark in (".", "!", "?", "\n")) + 1
+                ends = [position for mark in (".", "!", "?", "\n") if (position := text.find(mark, match.end())) != -1]
+                right = min(ends) if ends else len(text)
+                event = re.sub(r"\s+", " ", text[left:right]).strip(" ,;:-")
+                if not event:
+                    next_date_start = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+                    event = _event_after_date(text[match.end():next_date_start])
+
+            event = re.sub(r"\bDATE\s+ACADEMIC EVENT\s+DETAILS\b", "", event, flags=re.IGNORECASE).strip()
+            # Inline calendar prose often repeats the date inside the sentence
+            # we use as its event label. The date is already shown separately.
+            event = re.sub(re.escape(match.group(0)), "", event, flags=re.IGNORECASE)
+            event = re.sub(re.escape(date), "", event, flags=re.IGNORECASE)
+            event = re.sub(r"\s+([,.!?;:])", r"\1", event)
+            event = event.strip(" ,.;:-")
+            if re.fullmatch(r"and\s+reopen", event, flags=re.IGNORECASE):
+                event = "University offices reopen" if "office" in text[max(0, match.start() - 140):match.start()].lower() else "Offices reopen"
+            event = re.sub(r"\s+", " ", event)[:120]
+            entry = (filename, page_number, match.start(), date, event, standalone_date)
+            if key in entry_by_key:
+                prior_index = entry_by_key[key]
+                # A date-only table row usually gives a cleaner event label
+                # than the same date repeated in introductory prose.
+                if standalone_date and not entries[prior_index][5]:
+                    entries[prior_index] = entry
+                continue
+            seen.add(key)
+            entry_by_key[key] = len(entries)
+            entries.append(entry)
+
+    if not entries:
+        return "I couldn’t find any readable dates in the uploaded calendar."
+
+    entries.sort(key=lambda item: (min(_date_components(item[3]), default=(9999, 13, 32)), item[0].lower(), item[1], item[2]))
+    lines = ["Here are the dates I found in your uploaded calendar:"]
+    for _, _, _, date, event, _ in entries:
+        lines.append(f"• {date}" + (f" — {event}" if event else ""))
+    return "\n".join(lines)
+
+
+def suggest_follow_up_questions(question):
+    """Suggest useful next calendar questions based on the topic just asked."""
+    terms = set(_search_terms(question))
+    season = next((name for name in ("autumn", "fall", "spring", "summer") if name in terms), None)
+    season_name = {"fall": "Autumn"}.get(season, season.title() if season else None)
+
+    if _asks_for_all_dates(question):
+        suggestions = [
+            "What are the add/drop and withdrawal deadlines?",
+            "When do classes begin and end?",
+            "When are the exams and study days?",
+        ]
+    elif terms & {"exam", "final", "midterm", "assessment"}:
+        suggestions = [
+            "When do classes begin and end?",
+            "What are the course withdrawal deadlines?",
+            "Which holidays or breaks are listed?",
+        ]
+    elif terms & {"deadline", "due", "withdraw", "withdrawal", "drop", "project", "assignment", "submit"}:
+        suggestions = [
+            "What other important deadlines are listed?",
+            "When are the exams and study days?",
+            "What is the last day of classes?",
+        ]
+    elif terms & {"holiday", "holidays", "break", "recess", "closure"}:
+        suggestions = [
+            "When do classes begin and end?",
+            "When are the exams and study days?",
+            "What are the important course deadlines?",
+        ]
+    elif terms & {"begin", "start", "first", "end", "finish", "conclude", "semester", "term", "class", "instruction"}:
+        suggestions = [
+            "What are the important course deadlines?",
+            "When are the exams and study days?",
+            "Which holidays or breaks are listed?",
+        ]
+    else:
+        suggestions = [
+            "When do classes begin and end?",
+            "What are the important course deadlines?",
+            "When are the exams and study days?",
+        ]
+
+    if season_name:
+        suggestions[0] = f"What are the important {season_name} semester deadlines?"
+        suggestions[-1] = f"Which holidays or breaks occur during {season_name}?"
+    return suggestions
 
 
 def remove_document(document_id):
@@ -448,6 +676,12 @@ def _date_event_windows(text, date_pattern):
 
 def answer_question(question):
     """Use retrieved evidence to write an answer and return its source cards."""
+    # A request for every date is a document-wide extraction task, not a
+    # top-five retrieval question. Bypass both retrieval ranking and Gemini so
+    # the result is complete and unaffected by model quotas or paraphrasing.
+    if _asks_for_all_dates(question):
+        return {"answer": list_all_calendar_dates(), "sources": []}
+
     sources = retrieve(question)
     if not sources:
         return {
